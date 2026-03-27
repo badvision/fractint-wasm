@@ -18,6 +18,10 @@
 #include <sys/types.h>
 #include <sys/time.h>
 
+#ifdef WASM_BUILD
+#include <emscripten.h>
+#endif
+
 #include "port.h"
 #include "prototyp.h"
 int overflow = 0;
@@ -195,11 +199,32 @@ int
 waitkeypressed(timeout)
 int timeout;
 {
+#ifdef WASM_BUILD
+    /* In WASM we must yield to the browser event loop while waiting.
+     * emscripten_sleep(16) unwinds the C stack to WASM memory, returns
+     * control to the browser for ~16ms (one frame), then rewinds and
+     * resumes.  This keeps the UI responsive during menu waits.
+     * keypressed() is non-blocking and checks xgetkey() which reads
+     * from our key ring buffer filled by wasm_push_key() from JS. */
+    if (timeout) {
+        /* Timed wait: one sleep then check */
+        if (!keybuffer) {
+            emscripten_sleep(16);
+            keybuffer = getkeyint(0);
+        }
+        return keypressed();
+    }
+    while (!keypressed()) {
+        emscripten_sleep(16);   /* yield to browser event loop each frame */
+    }
+    return keypressed();
+#else
     while (!keybuffer) {
 	keybuffer = getkeyint(1);
 	if (timeout) break;
     }
     return keypressed();
+#endif
 }
 
 /*
@@ -222,10 +247,20 @@ getakey(void)
 {
     int ch;
 
+#ifdef WASM_BUILD
+    /* Blocking wait: yield to browser each frame until a key arrives */
+    do {
+        ch = getkeyint(0);
+        if (ch == 0)
+            emscripten_sleep(16);
+    } while (ch == 0);
+    return ch;
+#else
     do {
 	ch = getkeyint(1);
     } while (ch==0);
     return ch;
+#endif
 }
 
 /*

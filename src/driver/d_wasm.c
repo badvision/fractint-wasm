@@ -20,8 +20,10 @@
 #define EMSCRIPTEN_KEEPALIVE
 #endif
 
-#ifdef WASM_BUILD
+#ifdef __EMSCRIPTEN_PTHREADS__
 #include <pthread.h>
+#endif
+#ifdef WASM_BUILD
 #include <wasm_simd128.h>
 #endif
 
@@ -487,6 +489,7 @@ typedef struct {
     double cx, cy;
 } PixelWork;
 
+#ifdef __EMSCRIPTEN_PTHREADS__
 typedef struct {
     PixelWork  items[PQUEUE_SIZE];
     volatile int head;   /* producer writes here */
@@ -500,7 +503,9 @@ typedef struct {
 
 static PixelQueue pqueue;
 static pthread_t  pworkers[PQUEUE_THREADS];
+#endif /* __EMSCRIPTEN_PTHREADS__ */
 
+#ifdef __EMSCRIPTEN_PTHREADS__
 static void pqueue_init(void)
 {
     memset(&pqueue, 0, sizeof(pqueue));
@@ -542,6 +547,7 @@ static int pqueue_pop2(PixelWork *out)
     pthread_mutex_unlock(&pqueue.lock);
     return n;
 }
+#endif /* __EMSCRIPTEN_PTHREADS__ */
 
 /*
  * iter_to_color — map escape iteration count to palette index.
@@ -570,6 +576,7 @@ static int iter_to_color(long iter, long max_iter)
     return (int)(((iter - 1) % (colors - 1)) + 1);
 }
 
+#ifdef __EMSCRIPTEN_PTHREADS__
 static void *pworker_func(void *arg)
 {
     PixelWork items[2];
@@ -688,6 +695,7 @@ static void pworkers_abort(void)
         pthread_join(pworkers[i], NULL);
     }
 }
+#endif /* __EMSCRIPTEN_PTHREADS__ */
 
 /*
  * fractype_is_parallel_safe — returns 1 if the current fractal type
@@ -700,9 +708,13 @@ static void pworkers_abort(void)
  *
  * outside == 0 means ITER (default: colour by iteration count).
  * inside  >= 0 means a fixed palette index (default 1 = blue).
+ *
+ * Without pthreads (ASYNCIFY build), parallel path is unavailable —
+ * always returns 0 so the serial calcfract() path is used instead.
  */
 static int fractype_is_parallel_safe(void)
 {
+#ifdef __EMSCRIPTEN_PTHREADS__
     /* Only handle Mandelbrot (fp and integer), not Julia variants */
     if (fractype != MANDELFP && fractype != MANDEL)
         return 0;
@@ -710,10 +722,15 @@ static int fractype_is_parallel_safe(void)
     if (outside != 0 || inside < 0)
         return 0;
     return 1;
+#else
+    return 0;   /* parallel path requires pthreads; not available with ASYNCIFY */
+#endif
 }
 
 /* Current row being pushed by the producer (WS_PAR_PRODUCE) */
+#ifdef __EMSCRIPTEN_PTHREADS__
 static int par_current_row = 0;
+#endif
 
 #endif /* WASM_BUILD */
 
@@ -736,6 +753,7 @@ typedef enum {
     WS_INIT_VIDEO = 0,
     WS_CALCFRAC,
     WS_DONE,
+    WS_MENU,          /* running main_menu_switch() via ASYNCIFY */
     WS_COLOR_CYCLE,
     WS_PAN_CALC,      /* calculating only the newly exposed strip after a pan */
     WS_PAR_PRODUCE,   /* parallel SIMD path: push pixel rows into queue */
@@ -768,6 +786,19 @@ extern void calcfracinit(void);
 extern int  calcfract(void);
 extern void setvideomode(int, int, int, int);
 extern void spindac(int dir, int inc);
+
+/* main_menu_switch: Fractint's main keyboard dispatcher.
+ * Returns RESTART(1), IMAGESTART(2), RESTORESTART(3), CONTINUE(4), or 0.
+ * With ASYNCIFY, waitkeypressed() inside it yields to the browser event loop. */
+extern int main_menu_switch(int *kbdchar, int *frommandel, int *kbdmore,
+                            char *stacked, int axmode);
+#define MMS_RESTART      1
+#define MMS_IMAGESTART   2
+#define MMS_RESTORESTART 3
+#define MMS_CONTINUE     4
+
+/* Key pending for main_menu_switch dispatch */
+static int menu_pending_key = 0;
 
 extern struct videoinfo videoentry;
 extern struct videoinfo videotable[];
@@ -984,8 +1015,10 @@ static void wasm_main_loop_callback(void)
         {
             int result;
 
-#ifdef WASM_BUILD
-            /* Parallel SIMD path for Mandelbrot with simple coloring */
+#ifdef __EMSCRIPTEN_PTHREADS__
+            /* Parallel SIMD path for Mandelbrot with simple coloring.
+             * Not available with ASYNCIFY (no pthreads) — fractype_is_parallel_safe()
+             * returns 0 in that case, so this block is never entered. */
             if (fractype_is_parallel_safe()) {
                 pworkers_start();
                 par_current_row = 0;
@@ -1024,6 +1057,11 @@ static void wasm_main_loop_callback(void)
              * Key codes follow Fractint/DOS conventions:
              *   PAGE_UP=1073, PAGE_DOWN=1081, HOME=1071
              *   LEFT=1075, RIGHT=1077, UP=1072, DOWN=1080
+             *
+             * Keys not handled here are routed to main_menu_switch() via
+             * WS_MENU.  With ASYNCIFY, main_menu_switch() can call
+             * waitkeypressed() deep in its call stack and yield to the
+             * browser without hanging it.
              */
             int key = key_pop(); /* bypass restart_requested check in xgetkey */
             if (key != 0) {
@@ -1066,34 +1104,68 @@ static void wasm_main_loop_callback(void)
                     wasm_state  = WS_INIT_VIDEO;
                     break;
 
+                /* Keys that would require file I/O or are handled by JS UI:
+                 * silently ignore rather than passing to main_menu_switch. */
+                case 'r':    /* restore from disk — file I/O, ignore */
+                case 's':    /* save as GIF — file I/O, ignore (JS handles PNG save) */
+                case 'd':    /* shell to DOS — not applicable, ignore */
+                case '@':    /* execute batch file — file I/O, ignore */
+                    break;
+
                 default:
-                    /* Keys that open blocking menus cannot run in WASM — handle
-                     * useful ones directly; silently ignore the rest. */
-                    switch (key) {
-                    case '\\':   /* backslash — toggle color cycling */
-                        wasm_toggle_cycle(cycle_dir ? cycle_dir : 1);
-                        break;
-                    case 'e':    /* edit palette — not supportable, ignore */
-                    case 'r':    /* restore — ignore */
-                    case 's':    /* save — ignore (PNG save is in JS) */
-                    case 'd':    /* shell — ignore */
-                        break;
-                    case 'z':    /* zoom params — ignore gracefully */
-                    case 'x':    /* extended params — ignore */
-                    case 'y':    /* more params — ignore */
-                    case '@':    /* batch file — ignore */
-                        break;
-                    /* 't'/'T' fractal type — ignore; type picker is in the JS dropdown */
-                    case 't':
-                    case 'T':
-                        break;
-                    default:
-                        /* Truly unknown — do nothing, stay in WS_DONE */
-                        break;
-                    }
-                    break;  /* stay in WS_DONE */
+                    /* Route to main_menu_switch() via ASYNCIFY so menus work.
+                     * This includes 't' (fractal type), 'x'/'y'/'z' (params),
+                     * 'e' (edit palette), etc. */
+                    menu_pending_key = key;
+                    wasm_state = WS_MENU;
+                    break;
                 }
             }
+        }
+        break;
+
+    case WS_MENU:
+        {
+            /* Invoke main_menu_switch() with the pending key.
+             * With ASYNCIFY enabled, any call to waitkeypressed() inside
+             * main_menu_switch() (or functions it calls) will sleep via
+             * emscripten_sleep(16), yielding to the browser event loop.
+             * The stack is unwound to WASM memory and rewound when a key
+             * arrives, so this callback returns normally.
+             *
+             * The 'stacked' parameter is a DOS screen-save buffer; we pass
+             * NULL since we don't use the DOS screen-switching mechanism.
+             * The axmode (video mode AX register) is unused by our video.c.
+             */
+            int kbdmore   = 0;
+            int frommandel = 0;
+            int ret;
+
+            ret = main_menu_switch(&menu_pending_key, &frommandel,
+                                   &kbdmore, NULL, 0);
+
+            switch (ret) {
+            case MMS_RESTART:
+                calc_status = 0;
+                wasm_state  = WS_INIT_VIDEO;
+                break;
+            case MMS_IMAGESTART:
+                calc_status = 0;
+                wasm_state  = WS_INIT_VIDEO;
+                break;
+            case MMS_RESTORESTART:
+                wasm_state = WS_INIT_VIDEO;
+                break;
+            case MMS_CONTINUE:
+            default:
+                wasm_state = WS_DONE;
+                break;
+            }
+
+            /* If calc_status was reset by the menu (e.g. params changed),
+             * go to WS_INIT_VIDEO to start a new calculation. */
+            if (calc_status == 0 && wasm_state == WS_DONE)
+                wasm_state = WS_INIT_VIDEO;
         }
         break;
 
@@ -1128,7 +1200,7 @@ static void wasm_main_loop_callback(void)
         wasm_state = WS_INIT_VIDEO;
         break;
 
-#ifdef WASM_BUILD
+#ifdef __EMSCRIPTEN_PTHREADS__
     case WS_PAR_PRODUCE:
         /*
          * Multi-frame producer: push one full row of pixels per callback
@@ -1136,6 +1208,10 @@ static void wasm_main_loop_callback(void)
          * concurrently.  Each row push is non-blocking (the queue holds
          * PQUEUE_SIZE=4096 items, which comfortably fits one row at any
          * supported resolution).
+         *
+         * NOTE: This path is only reachable when pthreads are available.
+         * With ASYNCIFY (no pthreads), fractype_is_parallel_safe() always
+         * returns 0, so WS_CALCFRAC never transitions to WS_PAR_PRODUCE.
          *
          * y-coordinate formula mirrors dypixel_calc() in fractals.c:
          *   cy = yymax - row * delyy - col * delyy2
@@ -1195,7 +1271,15 @@ static void wasm_main_loop_callback(void)
          * implementation.  Kept as a named state for future use. */
         wasm_state = WS_DONE;
         break;
-#endif /* WASM_BUILD */
+#else
+    /* Without pthreads, WS_PAR_PRODUCE/WS_PAR_WAIT are unreachable
+     * (fractype_is_parallel_safe() returns 0), but the compiler needs
+     * the cases to be handled to suppress -Wswitch.  Fall back to serial. */
+    case WS_PAR_PRODUCE:
+    case WS_PAR_WAIT:
+        wasm_state = WS_INIT_VIDEO;
+        break;
+#endif /* __EMSCRIPTEN_PTHREADS__ */
     }
 }
 
