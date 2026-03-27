@@ -89,7 +89,7 @@ window.Module = window.Module || {};
     var wasmResize    = M.cwrap('wasm_resize',           'void',   ['number', 'number']);
 
     var canvas = document.getElementById('canvas');
-    var ctx = canvas.getContext('2d');
+    var ctx = canvas.getContext('2d', { willReadFrequently: false });
 
     /* Cache the last known dimensions to avoid re-allocating ImageData
      * every frame when the screen size hasn't changed. */

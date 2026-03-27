@@ -198,6 +198,7 @@
     if (!wasmZoomToRect || !wasmZoomAtPoint) return;
 
     var dragStart = null;
+    var dragEnd   = null;
 
     /* Overlay canvas for rubber-band zoom box */
     var overlay = document.createElement('canvas');
@@ -246,16 +247,50 @@
     canvas.addEventListener('mousemove', function (e) {
       if (!dragStart) return;
       var cur = canvasCoords(e);
-      var x1 = Math.min(dragStart.x, cur.x);
-      var y1 = Math.min(dragStart.y, cur.y);
-      var x2 = Math.max(dragStart.x, cur.x);
-      var y2 = Math.max(dragStart.y, cur.y);
+
+      var rawDx = cur.x - dragStart.x;
+      var rawDy = cur.y - dragStart.y;
+
+      var end;
+      if (!e.shiftKey) {
+        /* Constrain to canvas aspect ratio so zoomed view is not distorted */
+        var aspectRatio = canvas.width / canvas.height;
+        var absDx = Math.abs(rawDx);
+        var absDy = Math.abs(rawDy);
+
+        if (absDx / aspectRatio >= absDy) {
+          /* Width-constrained: fix dx, derive dy */
+          var constrainedDy = absDx / aspectRatio;
+          end = {
+            x: dragStart.x + rawDx,
+            y: dragStart.y + (rawDy >= 0 ? constrainedDy : -constrainedDy)
+          };
+        } else {
+          /* Height-constrained: fix dy, derive dx */
+          var constrainedDx = absDy * aspectRatio;
+          end = {
+            x: dragStart.x + (rawDx >= 0 ? constrainedDx : -constrainedDx),
+            y: dragStart.y + rawDy
+          };
+        }
+      } else {
+        /* Shift held: free aspect ratio */
+        end = cur;
+      }
+
+      dragEnd = end;
+
+      var x1 = Math.min(dragStart.x, end.x);
+      var y1 = Math.min(dragStart.y, end.y);
+      var x2 = Math.max(dragStart.x, end.x);
+      var y2 = Math.max(dragStart.y, end.y);
       drawZoomBox(x1, y1, x2, y2);
     });
 
     canvas.addEventListener('mouseup', function (e) {
       if (!dragStart) return;
-      var end = canvasCoords(e);
+      /* Use last constrained position from mousemove; fall back to raw coords */
+      var end = dragEnd || canvasCoords(e);
       var dx  = Math.abs(end.x - dragStart.x);
       var dy  = Math.abs(end.y - dragStart.y);
 
@@ -274,6 +309,7 @@
         wasmZoomToRect(x1, y1, x2, y2);
       }
       dragStart = null;
+      dragEnd   = null;
     });
 
     /* Cancel drag if mouse leaves the canvas */
@@ -281,6 +317,7 @@
       if (dragStart) {
         octx.clearRect(0, 0, overlay.width, overlay.height);
         dragStart = null;
+        dragEnd   = null;
       }
     });
 

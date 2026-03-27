@@ -59,7 +59,10 @@ WARN = -Wno-implicit-function-declaration \
        -Wno-int-conversion \
        -Wno-deprecated-non-prototype
 
-CFLAGS = $(DEFINES) $(INCLUDES) $(WARN) -O1 -fno-builtin
+CFLAGS = $(DEFINES) $(INCLUDES) $(WARN) -O3 -msimd128 -mbulk-memory -fno-builtin
+
+# Extra flags for hot fractal calculation paths (ffast-math safe here)
+CALC_CFLAGS = $(CFLAGS) -ffast-math
 
 # -----------------------------------------------------------------------
 # Emscripten link flags

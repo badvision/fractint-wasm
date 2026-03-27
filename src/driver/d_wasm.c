@@ -76,6 +76,24 @@ static Uint32 rgba_lut[256];
 extern unsigned char dacbox[256][3];
 
 /* ------------------------------------------------------------------ */
+/* Interrupt flag: set by zoom/resize/fractype to abort calcfract()   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * restart_requested — set to 1 before changing coordinates or fractype
+ * while a calculation may be in progress.  xgetkey() returns ESC when
+ * this flag is set, which propagates through keypressed() and causes
+ * calcfract() to abort cleanly with calc_status=3 (interrupted,
+ * non-resumable).  The flag is cleared in WS_INIT_VIDEO before the
+ * new calculation starts.
+ *
+ * keybuffer is defined in unix/general.c; we need to clear it too so
+ * the injected ESC doesn't linger and abort the next calculation.
+ */
+static volatile int restart_requested = 0;
+extern int keybuffer;
+
+/* ------------------------------------------------------------------ */
 /* Key ring buffer (power-of-two size for fast masking)               */
 /* ------------------------------------------------------------------ */
 
@@ -329,10 +347,18 @@ unsigned char *xgetfont(void)
  * xgetkey — called by fractint's getkeyint().
  * Always non-blocking in WASM (block parameter ignored).
  * Returns the next queued keycode, or 0.
+ *
+ * When restart_requested is set, returns ESC (27) to interrupt any
+ * in-progress calcfract() call cleanly.  The flag is only checked here,
+ * not consumed — WS_INIT_VIDEO clears it (along with keybuffer) before
+ * starting the new calculation.
  */
 int xgetkey(int block)
 {
     (void)block;
+    if (restart_requested) {
+        return 27; /* ESC — causes calcfract() to abort cleanly */
+    }
     return key_pop();
 }
 
@@ -396,10 +422,18 @@ typedef enum {
     WS_INIT_VIDEO = 0,
     WS_CALCFRAC,
     WS_DONE,
-    WS_COLOR_CYCLE
+    WS_COLOR_CYCLE,
+    WS_PAN_CALC   /* calculating only the newly exposed strip after a pan */
 } WasmState;
 
 static WasmState wasm_state = WS_INIT_VIDEO;
+
+/* Watchdog: force restart if WS_CALCFRAC is stuck for too many frames */
+static int calcfrac_frame_count = 0;
+static const int calcfrac_watchdog = 3000; /* ~50 s at 60 fps */
+
+/* Pan strip state: direction used only to determine which strip was exposed */
+static int pan_strip_dir  = 0; /* 1=right 2=left 3=down 4=up, 0=none */
 
 /* Direction for color cycling: +1 = forward, -1 = reverse */
 static int cycle_dir = 1;
@@ -432,6 +466,7 @@ extern int fractype;
 extern double xxmin, xxmax, yymin, yymax, xx3rd, yy3rd;
 extern double sxmin, sxmax, symin, symax;
 
+
 /*
  * wasm_zoom_by_factor — scale the view around its center.
  * factor < 1.0 zooms in (e.g. 0.5 = 2x); factor > 1.0 zooms out.
@@ -444,6 +479,7 @@ static void wasm_zoom_by_factor(double factor)
     double cy = (yymin + yymax) * 0.5;
     double hw = (xxmax - xxmin) * 0.5 * factor;
     double hh = (yymax - yymin) * 0.5 * factor;
+    restart_requested = 1; /* interrupt any in-progress calcfract() */
     xxmin = cx - hw;
     xxmax = cx + hw;
     xx3rd = xxmin;
@@ -460,19 +496,107 @@ static void wasm_zoom_by_factor(double factor)
 }
 
 /*
- * wasm_pan — shift the view by (dx_frac, dy_frac) of the current width/height.
- * Positive dx_frac pans right; positive dy_frac pans down.
+ * shift_pixel_buffer — memmove the 8-bit palette-index pixel buffer by
+ * (dx, dy) pixels.  Positive dx shifts content right (new strip on left);
+ * negative dx shifts content left (new strip on right).  The newly
+ * exposed strip is zeroed so it renders as palette index 0 (black) until
+ * the fractal calculation fills it in.
  */
-static void wasm_pan(double dx_frac, double dy_frac)
+static void shift_pixel_buffer(int dx, int dy)
 {
-    double dx = (xxmax - xxmin) * dx_frac;
-    double dy = (yymax - yymin) * dy_frac;
-    xxmin += dx;  xxmax += dx;  xx3rd += dx;
-    yymin += dy;  yymax += dy;  yy3rd += dy;
+    if (!screen_pixels || screen_w <= 0 || screen_h <= 0) return;
+
+    if (dx != 0) {
+        int y;
+        int adx = dx < 0 ? -dx : dx;
+        if (adx >= screen_w) {
+            memset(screen_pixels, 0, (size_t)(screen_w * screen_h));
+            return;
+        }
+        for (y = 0; y < screen_h; y++) {
+            BYTE *row = screen_pixels + y * screen_w;
+            if (dx > 0) {
+                /* shift content right: new strip on left */
+                memmove(row + dx, row, (size_t)(screen_w - dx));
+                memset(row, 0, (size_t)dx);
+            } else {
+                /* shift content left: new strip on right */
+                memmove(row, row + adx, (size_t)(screen_w - adx));
+                memset(row + screen_w - adx, 0, (size_t)adx);
+            }
+        }
+    }
+
+    if (dy != 0) {
+        int ady = dy < 0 ? -dy : dy;
+        if (ady >= screen_h) {
+            memset(screen_pixels, 0, (size_t)(screen_w * screen_h));
+            return;
+        }
+        if (dy > 0) {
+            /* shift content down: new strip at top */
+            memmove(screen_pixels + (size_t)dy * screen_w,
+                    screen_pixels,
+                    (size_t)(screen_h - dy) * screen_w);
+            memset(screen_pixels, 0, (size_t)dy * screen_w);
+        } else {
+            /* shift content up: new strip at bottom */
+            memmove(screen_pixels,
+                    screen_pixels + (size_t)ady * screen_w,
+                    (size_t)(screen_h - ady) * screen_w);
+            memset(screen_pixels + (size_t)(screen_h - ady) * screen_w,
+                   0, (size_t)ady * screen_w);
+        }
+    }
+}
+
+/*
+ * do_pan — incremental pan via arrow key.
+ * Shifts the existing pixel buffer so current pixels stay visible while
+ * the new strip is computed, then enters WS_PAN_CALC to fill the gap.
+ *
+ * Key codes (Fractint/DOS convention):
+ *   LEFT=1075  RIGHT=1077  UP=1072  DOWN=1080
+ */
+static void do_pan(int key)
+{
+    /* Pan by 20% of the current view */
+    double frac = 0.20;
+    double dx_coord = (xxmax - xxmin) * frac;
+    double dy_coord = (yymax - yymin) * frac;
+    int    px = (int)(screen_w * frac); /* pixel columns to shift */
+    int    py = (int)(screen_h * frac); /* pixel rows to shift */
+
+    switch (key) {
+    case 1077: /* RIGHT — view moves right (fractal coords increase) */
+        xxmin += dx_coord;  xxmax += dx_coord;  xx3rd += dx_coord;
+        /* content shifts left in buffer; new strip appears on right */
+        shift_pixel_buffer(-px, 0);
+        pan_strip_dir = 1; /* right */
+        break;
+    case 1075: /* LEFT */
+        xxmin -= dx_coord;  xxmax -= dx_coord;  xx3rd -= dx_coord;
+        shift_pixel_buffer(px, 0);
+        pan_strip_dir = 2; /* left */
+        break;
+    case 1080: /* DOWN — view moves down (fractal y decreases in canvas coords) */
+        yymin -= dy_coord;  yymax -= dy_coord;  yy3rd -= dy_coord;
+        shift_pixel_buffer(0, -py);
+        pan_strip_dir = 3; /* down */
+        break;
+    case 1072: /* UP */
+        yymin += dy_coord;  yymax += dy_coord;  yy3rd += dy_coord;
+        shift_pixel_buffer(0, py);
+        pan_strip_dir = 4; /* up */
+        break;
+    default:
+        return;
+    }
+
     sxmin = xxmin;  sxmax = xxmax;
     symin = yymin;  symax = yymax;
     calc_status = 0;
-    wasm_state  = WS_INIT_VIDEO;
+    wasm_state  = WS_PAN_CALC;
 }
 
 static void wasm_main_loop_callback(void)
@@ -480,6 +604,14 @@ static void wasm_main_loop_callback(void)
     switch (wasm_state) {
 
     case WS_INIT_VIDEO:
+        /* Clear interrupt/watchdog state before starting a new calculation */
+        restart_requested  = 0;
+        keybuffer          = 0; /* flush any lingering ESC injected by restart */
+        calcfrac_frame_count = 0;
+
+        /* Flush any stale keys from the user-visible ring too */
+        key_head = key_tail = 0;
+
         /* Set up video mode — mirrors big_while_loop() first iteration */
         far_memcpy((char far *)&videoentry,
                    (char far *)&videotable[adapter],
@@ -518,12 +650,28 @@ static void wasm_main_loop_callback(void)
 
     case WS_CALCFRAC:
         {
-            int result = calcfract();
+            int result;
+
+            /* Watchdog: if stuck too long, force a safe restart */
+            if (++calcfrac_frame_count > calcfrac_watchdog) {
+                calcfrac_frame_count = 0;
+                wasm_state = WS_INIT_VIDEO;
+                break;
+            }
+
+            result = calcfract();
             if (result == 0 || calc_status == 4) {
                 writevideopalette();
+                calcfrac_frame_count = 0;
                 wasm_state = WS_DONE;
+            } else if (result < 0 && restart_requested) {
+                /* Interrupted by our own restart flag — go to WS_INIT_VIDEO
+                 * which will clear the flag and start fresh. */
+                wasm_state = WS_INIT_VIDEO;
             }
-            /* result != 0 means interrupted; keep calling next frame */
+            /* Other interrupts (result < 0, restart not requested) mean
+             * calcfract() returned early but wants to resume next frame;
+             * stay in WS_CALCFRAC. */
         }
         break;
 
@@ -534,7 +682,7 @@ static void wasm_main_loop_callback(void)
              *   PAGE_UP=1073, PAGE_DOWN=1081, HOME=1071
              *   LEFT=1075, RIGHT=1077, UP=1072, DOWN=1080
              */
-            int key = xgetkey(0);
+            int key = key_pop(); /* bypass restart_requested check in xgetkey */
             if (key != 0) {
                 switch (key) {
                 case 'c':
@@ -560,22 +708,17 @@ static void wasm_main_loop_callback(void)
                     wasm_zoom_by_factor(2.0);
                     break;
 
-                /* Pan: arrow keys shift view by 20% of current extent */
+                /* Pan: arrow keys — incremental buffer shift + strip recalc */
                 case 1075: /* LEFT_ARROW */
-                    wasm_pan(-0.2, 0.0);
-                    break;
                 case 1077: /* RIGHT_ARROW */
-                    wasm_pan(0.2, 0.0);
-                    break;
                 case 1072: /* UP_ARROW */
-                    wasm_pan(0.0, -0.2);
-                    break;
                 case 1080: /* DOWN_ARROW */
-                    wasm_pan(0.0, 0.2);
+                    do_pan(key);
                     break;
 
                 /* Home: reset view to default for current fractal type */
                 case 1071: /* HOME */
+                    restart_requested = 1;
                     calc_status = 0;
                     wasm_state  = WS_INIT_VIDEO;
                     break;
@@ -595,9 +738,27 @@ static void wasm_main_loop_callback(void)
             spindac(cycle_dir, 1);
         }
         /* Any keypress stops cycling */
-        if (xgetkey(0) != 0) {
+        if (key_pop() != 0) {
             wasm_state = WS_DONE;
         }
+        break;
+
+    case WS_PAN_CALC:
+        /*
+         * The pixel buffer was already shifted in do_pan() so the user sees
+         * the new view position immediately.  Now do a full recalculation to
+         * fill in the correct pixel values across the whole screen.
+         *
+         * We drop straight into WS_INIT_VIDEO rather than trying to restrict
+         * calcfract() to just the new strip: calcfract() reads its bounds from
+         * the worklist (built by calcfracinit), so setting ixstart/ixstop
+         * directly has no effect on the standard escape-time engine.
+         *
+         * The slight visual artefact (shifted old pixels briefly visible) is
+         * far better UX than a black screen during the recalc.
+         */
+        pan_strip_dir = 0;
+        wasm_state = WS_INIT_VIDEO;
         break;
     }
 }
@@ -656,6 +817,7 @@ void wasm_set_cycle_speed(int speed)
 EMSCRIPTEN_KEEPALIVE
 void wasm_set_fractype(int type)
 {
+    restart_requested = 1; /* interrupt any in-progress calcfract() */
     fractype   = type;
     calc_status = 0;
     wasm_state  = WS_INIT_VIDEO;
@@ -701,6 +863,7 @@ void wasm_resize(int width, int height)
     videotable[0].ydots = sydots;
 
     /* Trigger full reinitialisation */
+    restart_requested = 1; /* interrupt any in-progress calcfract() */
     calc_status = 0;
     wasm_state  = WS_INIT_VIDEO;
 }
@@ -734,6 +897,7 @@ void wasm_zoom_to_rect(int px1, int py1, int px2, int py2)
     new_ymax = yymax - (dy * py1) / screen_h;
     new_ymin = yymax - (dy * py2) / screen_h;
 
+    restart_requested = 1; /* interrupt any in-progress calcfract() */
     xxmin = new_xmin;
     xxmax = new_xmax;
     yymin = new_ymin;
@@ -765,6 +929,7 @@ void wasm_zoom_at_point(int px, int py, double factor)
     hw = (xxmax - xxmin) * factor * 0.5;
     hh = (yymax - yymin) * factor * 0.5;
 
+    restart_requested = 1; /* interrupt any in-progress calcfract() */
     xxmin = cx - hw;
     xxmax = cx + hw;
     yymin = cy - hh;
