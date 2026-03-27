@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdint.h>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -58,6 +59,18 @@ int unixDisk    = 0;
 
 /* videotable[] is defined (and initialized) in unix/video.c */
 
+/* ------------------------------------------------------------------ */
+/* Text mode buffer — 25 x 80 cells — declared here, used throughout */
+/* ------------------------------------------------------------------ */
+#define TEXT_ROWS 25
+#define TEXT_COLS 80
+/* Each cell: low byte = char, high byte = CGA attribute (fg|bg<<4). */
+/* Default CGA attribute: white on black */
+#define TEXT_ATTR_DEFAULT 0x07
+static uint16_t text_buf[TEXT_ROWS * TEXT_COLS];
+static int text_mode_active = 0;
+static int text_buf_dirty   = 0;
+
 /* Screen pixel buffer — 8-bit palette indices, dynamically allocated */
 static BYTE *screen_pixels = NULL;
 static int screen_w = 0;
@@ -71,6 +84,24 @@ static int pixel_buf_size = 0;
  * Built by writevideopalette() from dacbox[256][3] (6-bit VGA values).
  */
 static Uint32 rgba_lut[256];
+
+/*
+ * Dirty flags for the JS render loop.
+ *   frame_dirty   — set when any pixel in screen_pixels changes
+ *   palette_dirty — set when rgba_lut is rebuilt (writevideopalette)
+ *
+ * wasm_consume_dirty() returns a bitmask and clears both flags:
+ *   bit 0 (value 1) = pixels changed  → must re-expand palette + putImageData
+ *   bit 1 (value 2) = palette changed → must re-expand palette + putImageData
+ * A return value of 0 means nothing changed; JS can skip the render work.
+ *
+ * During color cycling spindac() calls writevideopalette() (palette_dirty=1)
+ * but does NOT call writevideo/writevideoline (frame_dirty stays 0).
+ * Both flags trigger the same JS action (palette expand + blit), so the
+ * JS render loop checks dirty != 0 rather than inspecting individual bits.
+ */
+static int frame_dirty   = 0;
+static int palette_dirty = 0;
 
 /* dacbox is defined in unix/general.c */
 extern unsigned char dacbox[256][3];
@@ -199,6 +230,9 @@ int startvideo(void)
     if (screen_pixels) {
         memset(screen_pixels, 0, (size_t)(screen_w * screen_h));
     }
+    /* Entering graphics mode: hide text overlay */
+    text_mode_active = 0;
+    text_buf_dirty   = 1;
     return 0;
 }
 
@@ -217,6 +251,7 @@ void writevideo(int x, int y, int color)
     if (!screen_pixels) return;
     if (x < 0 || x >= screen_w || y < 0 || y >= screen_h) return;
     screen_pixels[y * screen_w + x] = (BYTE)(color & 0xFF);
+    frame_dirty = 1;
 }
 
 int readvideo(int x, int y)
@@ -238,6 +273,7 @@ void writevideoline(int y, int x, int lastx, BYTE *pixels)
             screen_pixels[y * screen_w + px] = pixels[i];
         }
     }
+    frame_dirty = 1;
 }
 
 void readvideoline(int y, int x, int lastx, BYTE *pixels)
@@ -280,6 +316,7 @@ int writevideopalette(void)
         Uint32 b = (Uint32)(dacbox[i][2]) << 2;
         rgba_lut[i] = 0xFF000000u | (b << 16) | (g << 8) | r;
     }
+    palette_dirty = 1;
     return 0;
 }
 
@@ -403,6 +440,22 @@ EMSCRIPTEN_KEEPALIVE
 int wasm_get_screen_dims(void)
 {
     return (screen_h << 16) | screen_w;
+}
+
+/*
+ * wasm_consume_dirty — return dirty bitmask and atomically clear both flags.
+ *   bit 0 (1) = pixel buffer changed (writevideo / writevideoline called)
+ *   bit 1 (2) = palette LUT changed  (writevideopalette called)
+ * Returns 0 if nothing has changed since the last call — JS render loop
+ * can skip the palette-expand + putImageData work entirely.
+ */
+EMSCRIPTEN_KEEPALIVE
+int wasm_consume_dirty(void)
+{
+    int d = (frame_dirty ? 1 : 0) | (palette_dirty ? 2 : 0);
+    frame_dirty   = 0;
+    palette_dirty = 0;
+    return d;
 }
 
 /* ------------------------------------------------------------------ */
@@ -945,10 +998,20 @@ void wasm_zoom_at_point(int px, int py, double factor)
 }
 
 /* ------------------------------------------------------------------ */
-/* xfcurses.c replacement — fake curses text layer                    */
+/* xfcurses.c replacement — text layer backed by text_buf            */
+/* (text_buf, text_mode_active, etc. declared at top of file)        */
 /* ------------------------------------------------------------------ */
 
-static WINDOW wasm_win = {0, 0, 0, 0, 25, 80, 0, NULL, NULL};
+static void text_putchar(int row, int col, int ch, int attr)
+{
+    if (row >= 0 && row < TEXT_ROWS && col >= 0 && col < TEXT_COLS) {
+        text_buf[row * TEXT_COLS + col] =
+            (uint16_t)((ch & 0xFF) | ((attr & 0xFF) << 8));
+        text_buf_dirty = 1;
+    }
+}
+
+static WINDOW wasm_win = {0, 0, 0, 0, 25, 80, TEXT_ATTR_DEFAULT, NULL, NULL};
 WINDOW *curwin = &wasm_win;
 
 WINDOW *initscr(void)
@@ -964,7 +1027,18 @@ void cbreak(void)  { }
 void nocbreak(void){ }
 void echo(void)    { }
 void noecho(void)  { }
-void clear(void)   { }
+
+void clear(void)
+{
+    int i;
+    for (i = 0; i < TEXT_ROWS * TEXT_COLS; i++)
+        text_buf[i] = (uint16_t)(' ' | (TEXT_ATTR_DEFAULT << 8));
+    if (curwin) { curwin->_cur_y = 0; curwin->_cur_x = 0; }
+    text_buf_dirty   = 1;
+    /* Called only from setvideomode() case 0 — mark text mode active */
+    text_mode_active = 1;
+}
+
 int  standout(void){ return 0; }
 int  standend(void){ return 0; }
 
@@ -975,33 +1049,237 @@ void wmove(WINDOW *win, int y, int x)
     win->_cur_x = x;
 }
 
-void waddch(WINDOW *win, const chtype ch)  { }
-void waddstr(WINDOW *win, char *str)       { }
-void wclear(WINDOW *win)                   { }
-void wdeleteln(WINDOW *win)                { }
-void winsertln(WINDOW *win)                { }
-void wrefresh(WINDOW *win)                 { }
-void xrefresh(WINDOW *win, int l1, int l2) { }
-void touchwin(WINDOW *win)                 { }
-void wtouchln(WINDOW *win, int y, int n, int changed) { }
-void wstandout(WINDOW *win)                { }
-void wstandend(WINDOW *win)                { }
-void delwin(WINDOW *win)                   { }
-void mvcur(int or, int oc, int nr, int nc) { }
-void refresh(int line1, int line2)         { }
-void xpopup(char *str)                     { }
-void set_margins(int width, int height)    { }
+void waddch(WINDOW *win, const chtype ch)
+{
+    int attr, r, c;
+    if (!win) return;
+    /* Newline: advance row, reset col */
+    if ((ch & 0xFF) == (unsigned)'\n') {
+        win->_cur_y++;
+        win->_cur_x = 0;
+        return;
+    }
+    attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
+    r = win->_cur_y;
+    c = win->_cur_x;
+    text_putchar(r, c, (int)(ch & 0xFF), attr & 0xFF);
+    win->_cur_x++;
+    if (win->_cur_x >= TEXT_COLS) {
+        win->_cur_x = 0;
+        win->_cur_y++;
+    }
+}
+
+void waddstr(WINDOW *win, char *str)
+{
+    if (!win || !str) return;
+    while (*str) {
+        waddch(win, (chtype)(unsigned char)*str++);
+    }
+}
+
+void wclear(WINDOW *win)
+{
+    int r, c, attr;
+    if (!win) return;
+    attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
+    for (r = 0; r < TEXT_ROWS; r++)
+        for (c = 0; c < TEXT_COLS; c++)
+            text_putchar(r, c, ' ', attr & 0xFF);
+    win->_cur_y = 0;
+    win->_cur_x = 0;
+    text_buf_dirty = 1;
+}
+
+void wdeleteln(WINDOW *win)
+{
+    /* Scroll up from win->_cur_y to TEXT_ROWS-1, blank last line */
+    int row, col, attr;
+    if (!win) return;
+    row = win->_cur_y;
+    if (row < 0 || row >= TEXT_ROWS - 1) return;
+    attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
+    memmove(&text_buf[row * TEXT_COLS],
+            &text_buf[(row + 1) * TEXT_COLS],
+            (size_t)(TEXT_ROWS - 1 - row) * TEXT_COLS * sizeof(uint16_t));
+    for (col = 0; col < TEXT_COLS; col++)
+        text_putchar(TEXT_ROWS - 1, col, ' ', attr & 0xFF);
+    text_buf_dirty = 1;
+}
+
+void winsertln(WINDOW *win)
+{
+    /* Scroll down from win->_cur_y, blank current line */
+    int row, col, attr;
+    if (!win) return;
+    row = win->_cur_y;
+    if (row < 0 || row >= TEXT_ROWS) return;
+    attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
+    if (row < TEXT_ROWS - 1)
+        memmove(&text_buf[(row + 1) * TEXT_COLS],
+                &text_buf[row * TEXT_COLS],
+                (size_t)(TEXT_ROWS - 1 - row) * TEXT_COLS * sizeof(uint16_t));
+    for (col = 0; col < TEXT_COLS; col++)
+        text_putchar(row, col, ' ', attr & 0xFF);
+    text_buf_dirty = 1;
+}
+
+void wrefresh(WINDOW *win)                 { (void)win; text_buf_dirty = 1; }
+void xrefresh(WINDOW *win, int l1, int l2) { (void)win; (void)l1; (void)l2; text_buf_dirty = 1; }
+void touchwin(WINDOW *win)                 { (void)win; }
+void wtouchln(WINDOW *win, int y, int n, int changed) { (void)win; (void)y; (void)n; (void)changed; }
+
+void wstandout(WINDOW *win)
+{
+    /* Switch to inverse-video: swap fg/bg nibbles of current attribute */
+    int attr;
+    if (!win) return;
+    attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
+    win->_cur_attr = ((attr & 0x0F) << 4) | ((attr >> 4) & 0x0F);
+}
+
+void wstandend(WINDOW *win)
+{
+    /* Restore to default attribute */
+    if (!win) return;
+    win->_cur_attr = TEXT_ATTR_DEFAULT;
+}
+
+void delwin(WINDOW *win)
+{
+    if (win && win != &wasm_win) free(win);
+}
+
+void mvcur(int or, int oc, int nr, int nc)
+{
+    (void)or; (void)oc; (void)nr; (void)nc;
+}
+
+void refresh(int line1, int line2)         { (void)line1; (void)line2; text_buf_dirty = 1; }
+void xpopup(char *str)                     { (void)str; }
+void set_margins(int width, int height)    { (void)width; (void)height; }
 
 WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x)
 {
     WINDOW *w = (WINDOW *)malloc(sizeof(WINDOW));
     if (!w) return NULL;
     memset(w, 0, sizeof(WINDOW));
-    w->_num_y = nlines;
-    w->_num_x = ncols;
-    w->_cur_y = begin_y;
-    w->_cur_x = begin_x;
+    w->_num_y    = nlines;
+    w->_num_x    = ncols;
+    w->_cur_y    = begin_y;
+    w->_cur_x    = begin_x;
+    w->_cur_attr = TEXT_ATTR_DEFAULT;
     return w;
+}
+
+/* ------------------------------------------------------------------ */
+/* Text/graphics mode switching                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * setvideomode() in unix/video.c calls clear()+wrefresh() for dotmode==0
+ * (text mode) and startvideo() for dotmode==19 (graphics).
+ * We hook text_mode_active via startvideo() for graphics-off and
+ * the clear() function above for text-on.
+ *
+ * startvideo() is our own function defined earlier in this file; we
+ * patch it to also clear the text_mode_active flag.
+ */
+
+/* ------------------------------------------------------------------ */
+/* Exported text-buffer accessors for JS rendering                    */
+/* ------------------------------------------------------------------ */
+
+EMSCRIPTEN_KEEPALIVE
+uint16_t *wasm_get_text_buf(void)
+{
+    return text_buf;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_is_text_mode(void)
+{
+    return text_mode_active;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_consume_text_dirty(void)
+{
+    int d = text_buf_dirty;
+    text_buf_dirty = 0;
+    return d;
+}
+
+/*
+ * wasm_enter_text_mode — JS test helper: activates text mode and writes
+ * a sample string to the text buffer so the overlay can be verified.
+ * Not called by production code paths.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_enter_text_mode(void)
+{
+    int col;
+    const char *msg = "Fractint Text Mode";
+    clear(); /* sets text_mode_active = 1 */
+    /* Write sample text on row 0 */
+    if (curwin) {
+        wmove(curwin, 0, 1);
+        curwin->_cur_attr = 0x1F; /* bright white on blue */
+        while (*msg) {
+            waddch(curwin, (chtype)(unsigned char)*msg++);
+        }
+    }
+    text_buf_dirty = 1;
+}
+
+/*
+ * wasm_exit_text_mode — JS test helper: deactivates text mode.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_exit_text_mode(void)
+{
+    text_mode_active = 0;
+    text_buf_dirty   = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Coordinate and parameter exports for URL sharing                   */
+/* ------------------------------------------------------------------ */
+
+EMSCRIPTEN_KEEPALIVE
+double wasm_get_xxmin(void) { return xxmin; }
+
+EMSCRIPTEN_KEEPALIVE
+double wasm_get_xxmax(void) { return xxmax; }
+
+EMSCRIPTEN_KEEPALIVE
+double wasm_get_yymin(void) { return yymin; }
+
+EMSCRIPTEN_KEEPALIVE
+double wasm_get_yymax(void) { return yymax; }
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_get_maxit(void)
+{
+    extern long maxit;
+    return (int)maxit;
+}
+
+/*
+ * wasm_set_coords — restore fractal coordinate corners from saved state
+ * (e.g. URL hash).  Triggers a full recalculation.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_coords(double xmin, double xmax, double ymin, double ymax)
+{
+    restart_requested = 1;
+    xxmin = xmin;  xxmax = xmax;
+    yymin = ymin;  yymax = ymax;
+    xx3rd = xxmin; yy3rd = yymin;
+    sxmin = xxmin; sxmax = xxmax;
+    symin = yymin; symax = yymax;
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
 }
 
 /* pixel[] array — referenced in video.c's #ifndef NCURSES block */

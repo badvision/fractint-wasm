@@ -82,11 +82,20 @@ window.Module = window.Module || {};
       prevOnInit();
     }
 
+    /* Initialise text overlay and URL sharing after WASM is ready */
+    if (window.FractintText) {
+      window.FractintText.init();
+    }
+    if (window.FractintShare) {
+      window.FractintShare.init();
+    }
+
     /* Get exported functions via cwrap */
     var getPixelBuf   = M.cwrap('wasm_get_pixel_buf',   'number', []);
     var getRgbaLut    = M.cwrap('wasm_get_rgba_lut',    'number', []);
     var getScreenDims = M.cwrap('wasm_get_screen_dims', 'number', []);
     var wasmResize    = M.cwrap('wasm_resize',           'void',   ['number', 'number']);
+    var consumeDirty  = M.cwrap('wasm_consume_dirty',   'number', []);
 
     var canvas = document.getElementById('canvas');
     var ctx = canvas.getContext('2d', { willReadFrequently: false });
@@ -101,6 +110,25 @@ window.Module = window.Module || {};
     function renderFrame() {
       /* Guard: HEAPU8 / HEAPU32 are available after init, but check anyway. */
       if (!M.HEAPU8 || !M.HEAPU32) {
+        requestAnimationFrame(renderFrame);
+        return;
+      }
+
+      /* Text overlay tick runs every frame regardless of pixel dirty state.
+       * FractintText.tick() handles its own dirty flag internally. */
+      if (window.FractintText) {
+        window.FractintText.tick();
+      }
+
+      /* Fast path: skip palette expansion entirely when nothing changed.
+       * wasm_consume_dirty() returns:
+       *   0 = nothing changed  → skip blit (saves ~1M LUT lookups/frame at idle)
+       *   1 = pixels changed   → re-expand and blit
+       *   2 = palette changed  → re-expand and blit (color cycling)
+       *   3 = both changed     → re-expand and blit
+       */
+      var dirty = consumeDirty();
+      if (dirty === 0) {
         requestAnimationFrame(renderFrame);
         return;
       }
@@ -132,7 +160,9 @@ window.Module = window.Module || {};
         cachedDst = new Uint32Array(cachedImageData.data.buffer);
       }
 
-      /* Map WASM heap views onto pixel buffer and RGBA LUT */
+      /* Map WASM heap views onto pixel buffer and RGBA LUT.
+       * All three arrays are typed (Uint8Array / Uint32Array) so V8 can
+       * vectorise the inner loop automatically. */
       var pixelBuf = M.HEAPU8.subarray(pixBufPtr, pixBufPtr + w * h);
       /* lutPtr is a byte offset; HEAPU32 index = lutPtr >> 2 */
       var lutBase  = lutPtr >>> 2;

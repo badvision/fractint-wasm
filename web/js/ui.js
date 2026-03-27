@@ -97,6 +97,7 @@
     var btnZoomOut   = document.getElementById('btn-zoom-out');
     var btnSave      = document.getElementById('btn-save');
     var fracTypeSelect = document.getElementById('fractal-type');
+    /* btn-share is wired in urlshare.js after WASM init */
 
     if (speedIn) {
       speedIn.addEventListener('input', function () {

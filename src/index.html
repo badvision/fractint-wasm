@@ -48,6 +48,7 @@
         <button id="btn-zoom-in">+ Zoom In</button>
         <button id="btn-zoom-out">- Zoom Out</button>
         <button id="btn-save">Save Image</button>
+        <button id="btn-share">Share URL</button>
       </div>
       <div class="help-hint">
         <small>Click = zoom in · Right-click = zoom out<br>
@@ -58,13 +59,21 @@ Scroll = zoom · +/C = color cycle · Home = reset</small>
   </div>
   <!--
     Script load order is critical:
+    0. coi-serviceworker — MUST be first: installs a Service Worker that
+       injects Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy
+       headers on reload, enabling SharedArrayBuffer (required for pthreads).
+       On hosts that already send these headers (local dev with emrun, or a
+       server configured with COOP/COEP) the worker is a harmless no-op.
     1. keyboard.js       — sets up key translation, pre-seeds Module
     2. ui.js             — loading overlay, controls, extends Module hooks
     3. fractint-wasm.js  — installs canvas renderer; MUST be before fractint.js
     4. fractint.js       — Emscripten glue: calls Module.onRuntimeInitialized
   -->
+  <script src="coi-serviceworker.min.js"></script>
   <script src="js/keyboard.js"></script>
   <script src="js/ui.js"></script>
+  <script src="js/textoverlay.js"></script>
+  <script src="js/urlshare.js"></script>
   <script src="js/fractint-wasm.js"></script>
   <script src="fractint.js"></script>
 </body>

@@ -71,10 +71,21 @@ CALC_CFLAGS = $(CFLAGS) -ffast-math
 EM_FLAGS  = -s USE_SDL=2
 EM_FLAGS += -s ALLOW_MEMORY_GROWTH=1
 EM_FLAGS += -s INITIAL_MEMORY=33554432
-EM_FLAGS += -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","HEAPU32"]'
-EM_FLAGS += -s EXPORTED_FUNCTIONS='["_main","_wasm_push_key","_wasm_get_pixel_buf","_wasm_get_rgba_lut","_wasm_get_screen_dims","_wasm_toggle_cycle","_wasm_set_cycle_speed","_wasm_set_fractype","_wasm_get_fractype","_wasm_resize","_wasm_zoom_to_rect","_wasm_zoom_at_point"]'
+EM_FLAGS += -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","HEAPU16","HEAPU32"]'
+EM_FLAGS += -s EXPORTED_FUNCTIONS='["_main","_wasm_push_key","_wasm_get_pixel_buf","_wasm_get_rgba_lut","_wasm_get_screen_dims","_wasm_toggle_cycle","_wasm_set_cycle_speed","_wasm_set_fractype","_wasm_get_fractype","_wasm_resize","_wasm_zoom_to_rect","_wasm_zoom_at_point","_wasm_consume_dirty","_wasm_get_text_buf","_wasm_is_text_mode","_wasm_consume_text_dirty","_wasm_enter_text_mode","_wasm_exit_text_mode","_wasm_get_xxmin","_wasm_get_xxmax","_wasm_get_yymin","_wasm_get_yymax","_wasm_get_maxit","_wasm_set_coords"]'
 EM_FLAGS += -s FORCE_FILESYSTEM=1
 EM_FLAGS += -s ENVIRONMENT=web
+
+# -----------------------------------------------------------------------
+# pthread support — enables SharedArrayBuffer-based Web Workers.
+# coi-serviceworker.min.js in web/ injects the required COOP/COEP headers
+# on static hosts (GitHub Pages) that don't allow custom HTTP headers.
+# PTHREAD_POOL_SIZE=4 pre-spawns 4 workers at startup (avoids first-use
+# latency); safe on M3 and most modern hardware.
+# -----------------------------------------------------------------------
+EM_FLAGS += -s USE_PTHREADS=1
+EM_FLAGS += -s PTHREAD_POOL_SIZE=4
+EM_FLAGS += -s SHARED_MEMORY=1
 
 # Preload data files when the directory is populated
 DATA_FILES := $(wildcard data/*)
@@ -142,4 +153,5 @@ deploy: all
 	cp src/index.html  $(OUTDIR)/
 	cp -r src/css      $(OUTDIR)/
 	cp -r src/js       $(OUTDIR)/
+	cp src/coi-serviceworker.min.js $(OUTDIR)/
 	@echo "Deployed to $(OUTDIR)/"
