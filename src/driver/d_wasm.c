@@ -738,7 +738,6 @@ typedef enum {
     WS_DONE,
     WS_COLOR_CYCLE,
     WS_PAN_CALC,      /* calculating only the newly exposed strip after a pan */
-    WS_MENU,          /* dispatching a key through Fractint's menu system */
     WS_PAR_PRODUCE,   /* parallel SIMD path: push pixel rows into queue */
     WS_PAR_WAIT       /* parallel SIMD path: wait for workers to finish */
 } WasmState;
@@ -755,27 +754,20 @@ static int pan_strip_dir  = 0; /* 1=right 2=left 3=down 4=up, 0=none */
 /* Direction for color cycling: +1 = forward, -1 = reverse */
 static int cycle_dir = 1;
 
-/* Key pending dispatch through main_menu_switch() in WS_MENU */
-static int menu_pending_key = 0;
-
 /* Frame-skip counters for cycling speed control.
  * delay() is a no-op in WASM, so we skip frames instead.
  * cycle_skip_max=1 means every frame (fastest); higher = slower. */
 static int cycle_skip_counter = 0;
 static int cycle_skip_max     = 1;
 
+/* Forward declaration for wasm_toggle_cycle (defined later in this file) */
+void wasm_toggle_cycle(int dir);
+
 /* Fractint internals used by the loop */
 extern void calcfracinit(void);
 extern int  calcfract(void);
 extern void setvideomode(int, int, int, int);
 extern void spindac(int dir, int inc);
-extern int  main_menu_switch(int *, int *, int *, char *, int);
-
-/* Return values from main_menu_switch (defined in fractint.h) */
-#define MMS_RESTART      1
-#define MMS_IMAGESTART   2
-#define MMS_RESTORESTART 3
-#define MMS_CONTINUE     4
 
 extern struct videoinfo videoentry;
 extern struct videoinfo videotable[];
@@ -1075,72 +1067,32 @@ static void wasm_main_loop_callback(void)
                     break;
 
                 default:
-                    /* Forward unhandled keys into Fractint's menu system */
-                    menu_pending_key = key;
-                    wasm_state = WS_MENU;
-                    break;
+                    /* Keys that open blocking menus cannot run in WASM — handle
+                     * useful ones directly; silently ignore the rest. */
+                    switch (key) {
+                    case '\\':   /* backslash — toggle color cycling */
+                        wasm_toggle_cycle(cycle_dir ? cycle_dir : 1);
+                        break;
+                    case 'e':    /* edit palette — not supportable, ignore */
+                    case 'r':    /* restore — ignore */
+                    case 's':    /* save — ignore (PNG save is in JS) */
+                    case 'd':    /* shell — ignore */
+                        break;
+                    case 'z':    /* zoom params — ignore gracefully */
+                    case 'x':    /* extended params — ignore */
+                    case 'y':    /* more params — ignore */
+                    case '@':    /* batch file — ignore */
+                        break;
+                    /* 't'/'T' fractal type — ignore; type picker is in the JS dropdown */
+                    case 't':
+                    case 'T':
+                        break;
+                    default:
+                        /* Truly unknown — do nothing, stay in WS_DONE */
+                        break;
+                    }
+                    break;  /* stay in WS_DONE */
                 }
-            }
-        }
-        break;
-
-    case WS_MENU:
-        {
-            /*
-             * Dispatch the pending key through main_menu_switch(), which is
-             * the same function that big_while_loop() uses to handle menu keys
-             * (t=fractal type, x/y/z=params, s=save, r=restore, etc.).
-             *
-             * main_menu_switch() may call blocking functions internally
-             * (get_fracttype, get_toggles, etc.) — these in turn call getakey()
-             * which calls xgetkey(), which is non-blocking in WASM and returns
-             * keys from the ring buffer.  The menu functions will complete on
-             * this same call if they don't need additional key input, or will
-             * loop polling getakey() until user provides input (which arrives
-             * via wasm_push_key in subsequent browser frames).
-             *
-             * After the menu function returns, the return value tells us what
-             * recalculation is needed:
-             *   MMS_IMAGESTART   — new fractal / params changed: reinit + calc
-             *   MMS_RESTORESTART — restore a saved image: reinit + load
-             *   MMS_RESTART      — full program restart: go to WS_INIT_VIDEO
-             *   MMS_CONTINUE     — stay in menu loop (already handled here)
-             *   0 (default)      — no recalc needed: return to WS_DONE
-             */
-            int frommandel = 0;
-            int kbdmore    = 1;
-            char stacked   = 0;
-            int mms_value;
-
-            mms_value = main_menu_switch(&menu_pending_key,
-                                         &frommandel,
-                                         &kbdmore,
-                                         &stacked,
-                                         videoentry.videomodeax);
-            menu_pending_key = 0;
-
-            switch (mms_value) {
-            case MMS_IMAGESTART:
-            case MMS_RESTORESTART:
-            case MMS_RESTART:
-                /* Parameters changed or fractal type changed: recalculate */
-                calc_status = 0;
-                wasm_state  = WS_INIT_VIDEO;
-                break;
-            case MMS_CONTINUE:
-                /* Menu loop wants to continue — stay in WS_MENU but there
-                 * is no more pending key; return to WS_DONE */
-                wasm_state = WS_DONE;
-                break;
-            default:
-                /* 0 = no recalc needed; check calc_status in case the menu
-                 * function set it to 0 (wants recalc) or left it at 4 (done) */
-                if (calc_status == 0 || calc_status == 2) {
-                    wasm_state = WS_INIT_VIDEO;
-                } else {
-                    wasm_state = WS_DONE;
-                }
-                break;
             }
         }
         break;
