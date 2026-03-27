@@ -168,6 +168,7 @@
     if (fracTypeSelect) {
       fracTypeSelect.addEventListener('change', function () {
         var type = parseInt(this.value, 10);
+        if (window.FractintShare) window.FractintShare.pushHistoryState();
         if (wasmSetFractype) {
           wasmSetFractype(type);
         } else if (typeof Module !== 'undefined' && Module.ccall) {
@@ -300,6 +301,7 @@
 
       if (dx < 5 && dy < 5) {
         /* Click: zoom in 2x centred on click point */
+        if (window.FractintShare) window.FractintShare.pushHistoryState();
         wasmZoomAtPoint(end.x, end.y, 0.5);
       } else {
         /* Drag: zoom to selected rectangle */
@@ -307,6 +309,7 @@
         var y1 = Math.min(dragStart.y, end.y);
         var x2 = Math.max(dragStart.x, end.x);
         var y2 = Math.max(dragStart.y, end.y);
+        if (window.FractintShare) window.FractintShare.pushHistoryState();
         wasmZoomToRect(x1, y1, x2, y2);
       }
       dragStart = null;
@@ -326,6 +329,7 @@
     canvas.addEventListener('contextmenu', function (e) {
       e.preventDefault();
       var pos = canvasCoords(e);
+      if (window.FractintShare) window.FractintShare.pushHistoryState();
       wasmZoomAtPoint(pos.x, pos.y, 2.0);
     });
 
@@ -334,7 +338,156 @@
       e.preventDefault();
       var pos    = canvasCoords(e);
       var factor = e.deltaY > 0 ? 2.0 : 0.5;
+      if (window.FractintShare) window.FractintShare.pushHistoryState();
       wasmZoomAtPoint(pos.x, pos.y, factor);
+    }, { passive: false });
+
+    initTouchZoom(canvas);
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Touch zoom/pan — initialised from initMouseZoom()               */
+  /* ---------------------------------------------------------------- */
+
+  function initTouchZoom(canvas) {
+    /* Fractint arrow-key codes (matches keyboard.js KEY constants) */
+    var KEY_LEFT  = 1075;
+    var KEY_RIGHT = 1077;
+    var KEY_UP    = 1072;
+    var KEY_DOWN  = 1080;
+
+    /* State for single-finger tap/drag */
+    var tapStart     = null;  /* { x, y, time } in canvas pixels */
+
+    /* State for two-finger pinch */
+    var pinchStart   = null;  /* { dist, cx, cy } */
+    var pinchCurrent = null;  /* { dist, cx, cy } */
+
+    /* Map a Touch object to canvas pixel coordinates */
+    function touchCanvasCoords(touch) {
+      var rect   = canvas.getBoundingClientRect();
+      var scaleX = canvas.width  / rect.width;
+      var scaleY = canvas.height / rect.height;
+      return {
+        x: Math.round((touch.clientX - rect.left) * scaleX),
+        y: Math.round((touch.clientY - rect.top)  * scaleY)
+      };
+    }
+
+    /* Euclidean distance between two touch points (in client pixels) */
+    function pinchDist(t1, t2) {
+      return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+    }
+
+    /* Midpoint of two touches in canvas pixel coordinates */
+    function pinchCenter(t1, t2) {
+      var mid = {
+        clientX: (t1.clientX + t2.clientX) / 2,
+        clientY: (t1.clientY + t2.clientY) / 2
+      };
+      return touchCanvasCoords(mid);
+    }
+
+    canvas.addEventListener('touchstart', function (e) {
+      e.preventDefault();
+
+      if (e.touches.length === 1) {
+        /* Single finger: record tap start */
+        var pos  = touchCanvasCoords(e.touches[0]);
+        tapStart = { x: pos.x, y: pos.y, time: Date.now() };
+        /* Reset any stale pinch state */
+        pinchStart   = null;
+        pinchCurrent = null;
+
+      } else if (e.touches.length === 2) {
+        /* Two fingers: begin pinch */
+        tapStart = null;
+        var dist = pinchDist(e.touches[0], e.touches[1]);
+        var ctr  = pinchCenter(e.touches[0], e.touches[1]);
+        pinchStart   = { dist: dist, cx: ctr.x, cy: ctr.y };
+        pinchCurrent = { dist: dist, cx: ctr.x, cy: ctr.y };
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', function (e) {
+      e.preventDefault();
+
+      if (e.touches.length === 2 && pinchStart) {
+        /* Accumulate latest pinch distance and center — applied on touchend */
+        var dist = pinchDist(e.touches[0], e.touches[1]);
+        var ctr  = pinchCenter(e.touches[0], e.touches[1]);
+        pinchCurrent = { dist: dist, cx: ctr.x, cy: ctr.y };
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', function (e) {
+      e.preventDefault();
+
+      /* --- Pinch-to-zoom: apply accumulated gesture on finger lift --- */
+      if (pinchStart && pinchCurrent && pinchStart.dist > 0) {
+        var factor = pinchStart.dist / pinchCurrent.dist;
+        /* Only zoom if there was meaningful movement (avoid noise) */
+        if (Math.abs(factor - 1.0) > 0.05) {
+          if (window.FractintShare) window.FractintShare.pushHistoryState();
+          wasmZoomAtPoint(pinchStart.cx, pinchStart.cy, factor);
+        }
+        pinchStart   = null;
+        pinchCurrent = null;
+        tapStart     = null;
+        return;
+      }
+      pinchStart   = null;
+      pinchCurrent = null;
+
+      /* --- Single-finger tap or drag --- */
+      if (!tapStart) return;
+
+      /* Need the released touch — use changedTouches */
+      if (e.changedTouches.length === 0) {
+        tapStart = null;
+        return;
+      }
+
+      var endPos  = touchCanvasCoords(e.changedTouches[0]);
+      var dx      = endPos.x - tapStart.x;
+      var dy      = endPos.y - tapStart.y;
+      var dist    = Math.hypot(dx, dy);
+      var elapsed = Date.now() - tapStart.time;
+
+      if (dist < 10 && elapsed < 300) {
+        /* Short tap with minimal movement: zoom in 2x at tap point */
+        if (window.FractintShare) window.FractintShare.pushHistoryState();
+        wasmZoomAtPoint(tapStart.x, tapStart.y, 0.5);
+
+      } else if (dist >= 10 && window.FractintKeyboard) {
+        /* Drag: inject arrow-key presses proportional to distance */
+        var absDx   = Math.abs(dx);
+        var absDy   = Math.abs(dy);
+        var presses = Math.min(Math.round(dist / 30), 8); /* cap at 8 */
+
+        if (absDx >= absDy) {
+          /* Dominant horizontal */
+          var hKey = dx > 0 ? KEY_RIGHT : KEY_LEFT;
+          for (var i = 0; i < presses; i++) {
+            window.FractintKeyboard.pushKey(hKey);
+          }
+        } else {
+          /* Dominant vertical */
+          var vKey = dy > 0 ? KEY_DOWN : KEY_UP;
+          for (var j = 0; j < presses; j++) {
+            window.FractintKeyboard.pushKey(vKey);
+          }
+        }
+      }
+
+      tapStart = null;
+    }, { passive: false });
+
+    canvas.addEventListener('touchcancel', function (e) {
+      e.preventDefault();
+      tapStart     = null;
+      pinchStart   = null;
+      pinchCurrent = null;
     }, { passive: false });
   }
 

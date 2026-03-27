@@ -107,6 +107,10 @@ window.Module = window.Module || {};
     var cachedImageData = null;
     var cachedDst = null;
 
+    /* Track rendering→idle transition so we update the URL hash exactly once
+     * when a fractal finishes, not on every idle frame. */
+    var wasRendering = false;
+
     function renderFrame() {
       /* Guard: HEAPU8 / HEAPU32 are available after init, but check anyway. */
       if (!M.HEAPU8 || !M.HEAPU32) {
@@ -129,6 +133,13 @@ window.Module = window.Module || {};
        */
       var dirty = consumeDirty();
       if (dirty === 0) {
+        /* Detect active→idle transition: update URL hash once when done. */
+        if (wasRendering) {
+          wasRendering = false;
+          if (window.FractintShare) {
+            window.FractintShare.updateUrlHash();
+          }
+        }
         requestAnimationFrame(renderFrame);
         return;
       }
@@ -149,6 +160,11 @@ window.Module = window.Module || {};
         requestAnimationFrame(renderFrame);
         return;
       }
+
+      /* Mark as actively rendering only once all guards pass.
+       * The next idle frame (dirty === 0) will detect this transition
+       * and fire updateUrlHash() exactly once. */
+      wasRendering = true;
 
       /* Resize canvas element only when dimensions actually change */
       if (w !== cachedW || h !== cachedH) {

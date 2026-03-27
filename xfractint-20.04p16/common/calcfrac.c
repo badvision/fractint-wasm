@@ -23,6 +23,9 @@ Additional fractal-specific modules are also invoked from CALCFRAC:
 #include "prototyp.h"
 #include "fractype.h"
 #include "targa_lc.h"
+#ifdef WASM_BUILD
+#include <pthread.h>
+#endif
 
 
 /* routines in this module      */
@@ -92,12 +95,23 @@ static long autologmap(void);
 #define sqrtl           sqrt
 #endif
 
+#ifdef WASM_BUILD
+__thread _LCMPLX linitorbit;
+__thread long lmagnitud;
+long llimit, llimit2, lclosenuff, l16triglim;
+__thread _CMPLX init,tmp,old,new,saved;
+__thread int color;
+__thread long coloriter, oldcoloriter, realcoloriter;
+__thread int row, col;
+int passes;
+#else
 _LCMPLX linitorbit;
 long lmagnitud, llimit, llimit2, lclosenuff, l16triglim;
 _CMPLX init,tmp,old,new,saved;
 int color;
 long coloriter, oldcoloriter, realcoloriter;
 int row, col, passes;
+#endif
 int iterations, invert;
 double f_radius,f_xcenter, f_ycenter; /* for inversion */
 void (_fastcall *putcolor)(int,int,int) = putcolor_a;
@@ -105,7 +119,12 @@ void (_fastcall *plot)(int,int,int) = putcolor_a;
 typedef void (_fastcall *PLOTC)(int,int,int);
 typedef void (_fastcall *GETC)(int,int,int);
 
+#ifdef WASM_BUILD
+__thread double magnitude;
+double rqlim, rqlim2, rqlim_save;
+#else
 double magnitude, rqlim, rqlim2, rqlim_save;
+#endif
 int no_mag_calc = 0;
 int use_old_period = 0;
 int use_old_distest = 0;
@@ -127,8 +146,14 @@ int     orbit_color=15;                 /* XOR color */
 
 int     ixstart, ixstop, iystart, iystop;       /* start, stop here */
 int     symmetry;          /* symmetry flag */
+#ifdef WASM_BUILD
+__thread int reset_periodicity; /* nonzero if escape time pixel rtn to reset */
+__thread int kbdcount;
+int     max_kbdcount;    /* avoids checking keyboard too often */
+#else
 int     reset_periodicity; /* nonzero if escape time pixel rtn to reset */
 int     kbdcount, max_kbdcount;    /* avoids checking keyboard too often */
+#endif
 
 U16 resume_info = 0;                    /* handle to resume info if allocated */
 int resuming;                           /* nonzero if resuming after interrupt */
@@ -1630,6 +1655,179 @@ static int OneOrTwoPass(void)
    return(0);
 }
 
+#ifdef WASM_BUILD
+/* -----------------------------------------------------------------------
+ * Parallel row calculation for WASM pthreads build.
+ * Each of WASM_NUM_THREADS threads processes every Nth row (striped).
+ * Per-pixel globals (row, col, color, coloriter, etc.) are __thread so
+ * each pthread has its own copy — no mutex needed for pixel writes since
+ * threads work on disjoint rows of screen_pixels[].
+ * ----------------------------------------------------------------------- */
+#define WASM_NUM_THREADS 4
+
+/* Shared abort flag: set to 1 by any thread that gets check_key() == -1 */
+static volatile int wasm_abort_flag = 0;
+/* Shared resume position: updated by aborting thread so OneOrTwoPass can
+ * record it in the worklist for later resumption. */
+static volatile int wasm_abort_row = 0;
+static volatile int wasm_abort_col = 0;
+
+typedef struct {
+   int passnum;    /* 1 or 2 */
+   int thread_id;  /* 0..WASM_NUM_THREADS-1 */
+   int start_row;  /* first row this thread processes */
+   int row_stride; /* step between rows for this thread (WASM_NUM_THREADS) */
+} WasmCalcArgs;
+
+static void *wasm_calc_thread(void *arg)
+{
+   WasmCalcArgs *a = (WasmCalcArgs *)arg;
+   int passnum   = a->passnum;
+   int my_row    = a->start_row;
+   int stride    = a->row_stride;
+
+   /* Initialize thread-local interrupt counter */
+   kbdcount = max_kbdcount;
+
+   while (my_row <= iystop)
+   {
+      if (wasm_abort_flag)
+         break;
+
+      row = my_row;
+      reset_periodicity = 1;
+      col = ixstart;
+
+      while (col <= ixstop)
+      {
+         if (wasm_abort_flag)
+            goto thread_done;
+
+         /* on 2nd pass of two, skip even pts */
+         if (quick_calc && !resuming)
+            if ((color = getcolor(col,row)) != inside) {
+               ++col;
+               continue;
+            }
+         if (passnum == 1 || stdcalcmode == '1' || (row&1) != 0 || (col&1) != 0)
+         {
+            if ((*calctype)() == -1) /* interrupted (check_key inside calctype) */
+            {
+               wasm_abort_row = row;
+               wasm_abort_col = col;
+               wasm_abort_flag = 1;
+               goto thread_done;
+            }
+            reset_periodicity = 0;
+            if (passnum == 1) /* first pass: copy pixel to adjacent positions */
+            {
+               if ((row&1) == 0 && row < iystop)
+               {
+                  (*plot)(col,row+1,color);
+                  if ((col&1) == 0 && col < ixstop)
+                     (*plot)(col+1,row+1,color);
+               }
+               if ((col&1) == 0 && col < ixstop)
+                  (*plot)(++col,row,color);
+            }
+         }
+         ++col;
+      }
+
+      /* Advance by stride rows (striped partitioning) */
+      my_row += stride;
+   }
+
+thread_done:
+   return NULL;
+}
+
+static int _fastcall StandardCalc(int passnum)
+{
+   got_status = 0;
+   curpass = passnum;
+
+   /* Only parallelize when not resuming mid-row (resume support requires
+    * tracking the exact interrupted row per-thread, which we don't do here).
+    * For simplicity we parallelize all non-resuming passes. */
+   if (!resuming)
+   {
+      pthread_t threads[WASM_NUM_THREADS];
+      WasmCalcArgs args[WASM_NUM_THREADS];
+      int i;
+
+      wasm_abort_flag = 0;
+
+      for (i = 0; i < WASM_NUM_THREADS; i++)
+      {
+         args[i].passnum    = passnum;
+         args[i].thread_id  = i;
+         args[i].start_row  = yybegin + i;
+         args[i].row_stride = WASM_NUM_THREADS;
+         pthread_create(&threads[i], NULL, wasm_calc_thread, &args[i]);
+      }
+
+      for (i = 0; i < WASM_NUM_THREADS; i++)
+         pthread_join(threads[i], NULL);
+
+      if (wasm_abort_flag)
+      {
+         /* Restore row/col on main thread so OneOrTwoPass can record
+          * the resume position in the worklist. */
+         row = wasm_abort_row;
+         col = wasm_abort_col;
+         currow = row;
+         return -1;
+      }
+      currow = iystop;
+      return 0;
+   }
+
+   /* Resuming: fall back to serial calculation */
+   row = yybegin;
+   col = xxbegin;
+
+   while (row <= iystop)
+   {
+      currow = row;
+      reset_periodicity = 1;
+      while (col <= ixstop)
+      {
+         if (quick_calc && !resuming)
+            if ((color = getcolor(col,row)) != inside) {
+               ++col;
+               continue;
+            }
+         if (passnum == 1 || stdcalcmode == '1' || (row&1) != 0 || (col&1) != 0)
+         {
+            if ((*calctype)() == -1)
+               return(-1);
+            resuming = 0;
+            reset_periodicity = 0;
+            if (passnum == 1)
+            {
+               if ((row&1) == 0 && row < iystop)
+               {
+                  (*plot)(col,row+1,color);
+                  if ((col&1) == 0 && col < ixstop)
+                     (*plot)(col+1,row+1,color);
+               }
+               if ((col&1) == 0 && col < ixstop)
+                  (*plot)(++col,row,color);
+            }
+         }
+         ++col;
+      }
+      col = ixstart;
+      if (passnum == 1 && (row&1) == 0)
+         ++row;
+      ++row;
+   }
+   return(0);
+}
+
+#else /* !WASM_BUILD — original serial implementation */
+
 static int _fastcall StandardCalc(int passnum)
 {
    got_status = 0;
@@ -1676,6 +1874,8 @@ static int _fastcall StandardCalc(int passnum)
    }
    return(0);
 }
+
+#endif /* WASM_BUILD */
 
 
 int calcmand(void)              /* fast per pixel 1/2/b/g, called with row & col set */
