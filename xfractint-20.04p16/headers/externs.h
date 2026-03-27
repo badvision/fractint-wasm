@@ -67,22 +67,10 @@ extern long                  cimag;
 extern double                closenuff;
 extern double                closeprox;
 extern _CMPLX                coefficient;
-#ifdef WASM_BUILD
-extern __thread int          col;
-#else
 extern int                   col;
-#endif
-#ifdef WASM_BUILD
-extern __thread int          color;
-#else
 extern int                   color;
-#endif
 extern char                  colorfile[];
-#ifdef WASM_BUILD
-extern __thread long         coloriter;
-#else
 extern long                  coloriter;
-#endif
 extern int                   colorpreloaded;
 extern int                   ColorPS;
 extern int                   colors;
@@ -235,11 +223,7 @@ extern int                   imgboxcount;
 extern U16                   imgboxhandle;
 extern char                  image_map;
 extern int                   init3d[20];
-#ifdef WASM_BUILD
-extern __thread _CMPLX       init;
-#else
 extern _CMPLX                init;
-#endif
 extern int                   initbatch;
 extern int                   initcyclelimit;
 extern int                   initmode;
@@ -261,11 +245,7 @@ extern char *                JIIMmethod[];
 extern int                   juli3Dmode;
 extern char *                juli3Doptions[];
 extern int                   julibrot;
-#ifdef WASM_BUILD
-extern __thread int          kbdcount;
-#else
 extern int                   kbdcount;
-#endif
 extern int                   keep_scrn_coords;
 extern int                   keybuffer;
 extern long                  l16triglim;
@@ -280,20 +260,12 @@ extern char                  LFileName[];
 extern char                  light_name[];
 extern BYTE *                line_buff;
 extern _LCMPLX               linit;
-#ifdef WASM_BUILD
-extern __thread _LCMPLX      linitorbit;
-#else
 extern _LCMPLX               linitorbit;
-#endif
 extern long                  linitx;
 extern long                  linity;
 extern long                  llimit2;
 extern long                  llimit;
-#ifdef WASM_BUILD
-extern __thread long         lmagnitud;
-#else
 extern long                  lmagnitud;
-#endif
 extern char                  LName[];
 extern _LCMPLX               lnew;
 extern int                   loaded3d;
@@ -321,11 +293,7 @@ extern long (_fastcall *     lypixel)(void); /* set in FRACTALS.C */
 extern int                   lzw[2];
 extern long                  l_at_rad;
 extern MATRIX                m;
-#ifdef WASM_BUILD
-extern __thread double       magnitude;
-#else
 extern double                magnitude;
-#endif
 extern enum Major            major_method;
 extern BYTE far *            mapdacbox;
 extern int                   mapset;
@@ -368,11 +336,7 @@ extern double                mxminfp;
 extern double                mymaxfp;
 extern double                myminfp;
 extern int                   name_stack_ptr;
-#ifdef WASM_BUILD
-extern __thread _CMPLX       new;
-#else
 extern _CMPLX                new;
-#endif
 extern char                  newodpx;
 extern char                  newodpy;
 extern double                newopx;
@@ -390,13 +354,8 @@ extern int                   num_worklist;
 extern int                   nxtscreenflag;
 extern int                   Offset;
 extern int                   oktoprint;
-#ifdef WASM_BUILD
-extern __thread _CMPLX       old;
-extern __thread long         oldcoloriter;
-#else
 extern _CMPLX                old;
 extern long                  oldcoloriter;
-#endif
 extern BYTE                  olddacbox[256][3];
 extern U16                   oldhistory_handle;
 extern int                   old_demm_colors;
@@ -491,11 +450,7 @@ extern int                   rangeslen;
 extern int                   RAY;
 extern char                  ray_name[];
 extern char                  readname[];
-#ifdef WASM_BUILD
-extern __thread long         realcoloriter;
-#else
 extern long                  realcoloriter;
-#endif
 extern int                   reallyega;
 extern char                  recordcolors;
 extern int                   red_bright;
@@ -503,11 +458,7 @@ extern int                   red_crop_left;
 extern int                   red_crop_right;
 extern int                   release;
 extern int                   resave_flag;
-#ifdef WASM_BUILD
-extern __thread int          reset_periodicity;
-#else
 extern int                   reset_periodicity;
-#endif
 extern U16                   resume_info;
 extern int                   resume_len;
 extern int                   resuming;
@@ -519,11 +470,7 @@ extern _CMPLX *              roots;
 extern int                   rotate_hi;
 extern int                   rotate_lo;
 extern double                roverd;
-#ifdef WASM_BUILD
-extern __thread int          row;
-#else
 extern int                   row;
-#endif
 extern int                   rowcount;
 extern double                rqlim2;
 extern double                rqlim;
@@ -859,11 +806,7 @@ extern int                   timedsave;
 extern int                   timerflag;
 extern long                  timer_interval;
 extern long                  timer_start;
-#ifdef WASM_BUILD
-extern __thread _CMPLX       tmp;
-#else
 extern _CMPLX                tmp;
-#endif
 extern char                  tempdir[];
 extern double                toosmall;
 extern int                   totpasses;
