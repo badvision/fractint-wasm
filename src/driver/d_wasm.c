@@ -20,6 +20,11 @@
 #define EMSCRIPTEN_KEEPALIVE
 #endif
 
+#ifdef WASM_BUILD
+#include <pthread.h>
+#include <wasm_simd128.h>
+#endif
+
 /* SDL2 via Emscripten -s USE_SDL=2 */
 #include <SDL2/SDL.h>
 
@@ -27,6 +32,7 @@
 /* Include our WASM-safe xfcurses.h before prototyp.h to define WINDOW type */
 #include "xfcurses.h"
 #include "prototyp.h"
+#include "fractype.h"
 
 /* fpe_handler is defined in unix/general.c */
 extern void fpe_handler(int signum);
@@ -467,6 +473,251 @@ int wasm_consume_dirty(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Parallel pixel queue                                                */
+/* ------------------------------------------------------------------ */
+
+#ifdef WASM_BUILD
+
+#define PQUEUE_SIZE 4096   /* must be power of 2; fits >3 rows at 1280px */
+#define PQUEUE_MASK (PQUEUE_SIZE - 1)
+#define PQUEUE_THREADS 4
+
+typedef struct {
+    int    row, col;
+    double cx, cy;
+} PixelWork;
+
+typedef struct {
+    PixelWork  items[PQUEUE_SIZE];
+    volatile int head;   /* producer writes here */
+    volatile int tail;   /* consumers read here */
+    pthread_mutex_t lock;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+    volatile int    done;    /* producer sets to 1 when finished pushing */
+    volatile int    abort;   /* set to 1 to stop all workers */
+} PixelQueue;
+
+static PixelQueue pqueue;
+static pthread_t  pworkers[PQUEUE_THREADS];
+
+static void pqueue_init(void)
+{
+    memset(&pqueue, 0, sizeof(pqueue));
+    pthread_mutex_init(&pqueue.lock, NULL);
+    pthread_cond_init(&pqueue.not_empty, NULL);
+    pthread_cond_init(&pqueue.not_full, NULL);
+}
+
+/* Push one item. Blocks if full. Returns 0 if aborted. */
+static int pqueue_push(PixelWork item)
+{
+    pthread_mutex_lock(&pqueue.lock);
+    while (((pqueue.head - pqueue.tail) & PQUEUE_MASK) == PQUEUE_MASK - 1) {
+        if (pqueue.abort) { pthread_mutex_unlock(&pqueue.lock); return 0; }
+        pthread_cond_wait(&pqueue.not_full, &pqueue.lock);
+    }
+    if (pqueue.abort) { pthread_mutex_unlock(&pqueue.lock); return 0; }
+    pqueue.items[pqueue.head & PQUEUE_MASK] = item;
+    pqueue.head++;
+    pthread_cond_signal(&pqueue.not_empty);
+    pthread_mutex_unlock(&pqueue.lock);
+    return 1;
+}
+
+/* Pop up to 2 items. Returns count popped (0 = queue empty and done). */
+static int pqueue_pop2(PixelWork *out)
+{
+    int n;
+    pthread_mutex_lock(&pqueue.lock);
+    while ((pqueue.head == pqueue.tail) && !pqueue.done && !pqueue.abort) {
+        pthread_cond_wait(&pqueue.not_empty, &pqueue.lock);
+    }
+    n = 0;
+    while (n < 2 && pqueue.head != pqueue.tail && !pqueue.abort) {
+        out[n++] = pqueue.items[pqueue.tail & PQUEUE_MASK];
+        pqueue.tail++;
+        pthread_cond_signal(&pqueue.not_full);
+    }
+    pthread_mutex_unlock(&pqueue.lock);
+    return n;
+}
+
+/*
+ * iter_to_color — map escape iteration count to palette index.
+ *
+ * Mirrors Fractint's StandardFractal plot_pixel path for the simple case:
+ *   outside >= 0 (default): uses escape iteration count
+ *   inside >= 0  (default 1): uses inside color directly
+ *
+ * For the SIMD parallel path we only handle: outside == 0 (default ITER)
+ * and inside == 1 (default blue).  The serial path handles everything else.
+ *
+ * Standard mapping (save_release > 1950, colors == 256):
+ *   escaped:  color = ((iter - 1) % (colors - 1)) + 1   [skips color 0]
+ *   inside:   coloriter = inside (1), color = 1          [direct]
+ */
+static int iter_to_color(long iter, long max_iter)
+{
+    if (iter >= max_iter) {
+        /* Inside point — use inside color (default 1 = blue) */
+        int c = (inside >= 0) ? inside : 0;
+        if (c == 0) return 0;
+        return c % colors;
+    }
+    if (iter == 0) iter = 1; /* match Fractint: coloriter==0 becomes 1 */
+    /* Escaped: skip color 0; cycle through colors 1..255 */
+    return (int)(((iter - 1) % (colors - 1)) + 1);
+}
+
+static void *pworker_func(void *arg)
+{
+    PixelWork items[2];
+
+    (void)arg;
+
+    while (!pqueue.abort) {
+        int n = pqueue_pop2(items);
+        if (n == 0) break;   /* queue done and drained */
+
+        if (n == 2) {
+            /* SIMD path: process 2 pixels with f64x2 */
+            v128_t cr = wasm_f64x2_make(items[0].cx, items[1].cx);
+            v128_t ci = wasm_f64x2_make(items[0].cy, items[1].cy);
+            v128_t zr = wasm_f64x2_splat(0.0);
+            v128_t zi = wasm_f64x2_splat(0.0);
+            v128_t bailout = wasm_f64x2_splat(4.0);
+            /* iteration counts as doubles for lane accumulation */
+            v128_t iters  = wasm_f64x2_splat(0.0);
+            v128_t one    = wasm_f64x2_splat(1.0);
+            v128_t active = wasm_f64x2_splat(1.0); /* 1.0 = still iterating */
+
+            long limit = maxit;
+            long i;
+            for (i = 0; i < limit; i++) {
+                v128_t zr2  = wasm_f64x2_mul(zr, zr);
+                v128_t zi2  = wasm_f64x2_mul(zi, zi);
+                v128_t mag2 = wasm_f64x2_add(zr2, zi2);
+
+                /* lanes still within bailout radius */
+                v128_t still_in = wasm_f64x2_le(mag2, bailout);
+                /* active = active AND still_in (keeps 1.0 only for unlaunched) */
+                active = wasm_v128_and(active, still_in);
+                /* count iterations only for active lanes */
+                iters = wasm_f64x2_add(iters, wasm_v128_and(one,
+                            wasm_f64x2_ne(active, wasm_f64x2_splat(0.0))));
+
+                /* if both lanes escaped, done early */
+                if (!wasm_v128_any_true(active)) break;
+
+                /* z = z² + c */
+                v128_t new_zr = wasm_f64x2_add(
+                    wasm_f64x2_sub(zr2, zi2), cr);
+                v128_t new_zi = wasm_f64x2_add(
+                    wasm_f64x2_mul(wasm_f64x2_add(zr, zr), zi), ci);
+                zr = new_zr;
+                zi = new_zi;
+            }
+
+            /* Extract iteration counts from SIMD lanes */
+            long iter0 = (long)wasm_f64x2_extract_lane(iters, 0);
+            long iter1 = (long)wasm_f64x2_extract_lane(iters, 1);
+
+            /* Write pixels directly to screen buffer */
+            int c0 = iter_to_color(iter0, limit);
+            int c1 = iter_to_color(iter1, limit);
+            screen_pixels[items[0].row * screen_w + items[0].col] = (unsigned char)c0;
+            screen_pixels[items[1].row * screen_w + items[1].col] = (unsigned char)c1;
+
+        } else {
+            /* n == 1: scalar path for odd last pixel */
+            double czr = items[0].cx, czi = items[0].cy;
+            double pzr = 0.0, pzi = 0.0;
+            long iter = 0;
+            long limit = maxit;
+            for (; iter < limit; iter++) {
+                double r2 = pzr * pzr;
+                double i2 = pzi * pzi;
+                if (r2 + i2 > 4.0) break;
+                double nr = r2 - i2 + czr;
+                pzi = 2.0 * pzr * pzi + czi;
+                pzr = nr;
+            }
+            screen_pixels[items[0].row * screen_w + items[0].col] =
+                (unsigned char)iter_to_color(iter, maxit);
+        }
+    }
+    return NULL;
+}
+
+static void pworkers_start(void)
+{
+    int i;
+    pqueue_init();
+    pqueue.done  = 0;
+    pqueue.abort = 0;
+    pqueue.head  = 0;
+    pqueue.tail  = 0;
+    for (i = 0; i < PQUEUE_THREADS; i++) {
+        pthread_create(&pworkers[i], NULL, pworker_func, NULL);
+    }
+}
+
+static void pworkers_finish(void)
+{
+    int i;
+    pthread_mutex_lock(&pqueue.lock);
+    pqueue.done = 1;
+    pthread_cond_broadcast(&pqueue.not_empty);
+    pthread_mutex_unlock(&pqueue.lock);
+    for (i = 0; i < PQUEUE_THREADS; i++) {
+        pthread_join(pworkers[i], NULL);
+    }
+    frame_dirty = 1;
+}
+
+static void pworkers_abort(void)
+{
+    int i;
+    pthread_mutex_lock(&pqueue.lock);
+    pqueue.abort = 1;
+    pthread_cond_broadcast(&pqueue.not_empty);
+    pthread_cond_broadcast(&pqueue.not_full);
+    pthread_mutex_unlock(&pqueue.lock);
+    for (i = 0; i < PQUEUE_THREADS; i++) {
+        pthread_join(pworkers[i], NULL);
+    }
+}
+
+/*
+ * fractype_is_parallel_safe — returns 1 if the current fractal type
+ * can be computed by our SIMD Mandelbrot path, and the coloring mode
+ * is simple enough (outside==ITER, inside>=0).
+ *
+ * We handle MANDELFP (4) and MANDEL integer (0) since both iterate
+ * z = z² + c from z=0.  Julia types require a fixed c and variable z0
+ * which differs from the Mandelbrot formula — fall through to serial.
+ *
+ * outside == 0 means ITER (default: colour by iteration count).
+ * inside  >= 0 means a fixed palette index (default 1 = blue).
+ */
+static int fractype_is_parallel_safe(void)
+{
+    /* Only handle Mandelbrot (fp and integer), not Julia variants */
+    if (fractype != MANDELFP && fractype != MANDEL)
+        return 0;
+    /* Only simple outside/inside coloring — no smooth, no distance est. */
+    if (outside != 0 || inside < 0)
+        return 0;
+    return 1;
+}
+
+/* Current row being pushed by the producer (WS_PAR_PRODUCE) */
+static int par_current_row = 0;
+
+#endif /* WASM_BUILD */
+
+/* ------------------------------------------------------------------ */
 /* WASM main loop                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -474,18 +725,22 @@ int wasm_consume_dirty(void)
  * wasm_state drives the render pipeline without blocking the browser
  * event loop.
  *
- * WS_INIT_VIDEO   — first callback: set video mode, init fractal params
- * WS_CALCFRAC     — subsequent callbacks: run calcfrac() chunk-by-chunk
- * WS_DONE         — fractal finished; idle, processes navigation keys
- * WS_COLOR_CYCLE  — one spindac() step per frame; stops on any keypress
+ * WS_INIT_VIDEO    — first callback: set video mode, init fractal params
+ * WS_CALCFRAC      — subsequent callbacks: run calcfrac() chunk-by-chunk
+ * WS_DONE          — fractal finished; idle, processes navigation keys
+ * WS_COLOR_CYCLE   — one spindac() step per frame; stops on any keypress
+ * WS_PAR_PRODUCE   — multi-frame producer: push one row per frame into pqueue
+ * WS_PAR_WAIT      — wait for workers to drain and finish, then transition
  */
 typedef enum {
     WS_INIT_VIDEO = 0,
     WS_CALCFRAC,
     WS_DONE,
     WS_COLOR_CYCLE,
-    WS_PAN_CALC,  /* calculating only the newly exposed strip after a pan */
-    WS_MENU       /* dispatching a key through Fractint's menu system */
+    WS_PAN_CALC,      /* calculating only the newly exposed strip after a pan */
+    WS_MENU,          /* dispatching a key through Fractint's menu system */
+    WS_PAR_PRODUCE,   /* parallel SIMD path: push pixel rows into queue */
+    WS_PAR_WAIT       /* parallel SIMD path: wait for workers to finish */
 } WasmState;
 
 static WasmState wasm_state = WS_INIT_VIDEO;
@@ -533,6 +788,9 @@ extern int calc_status;
 extern int showfile;
 extern double dxsize, dysize;
 extern int fractype;
+extern int outside;
+extern int inside;
+extern long maxit;
 
 /* Coordinate corners (defined in common/calcfrac.c / framain2.c) */
 extern double xxmin, xxmax, yymin, yymax, xx3rd, yy3rd;
@@ -734,6 +992,17 @@ static void wasm_main_loop_callback(void)
         {
             int result;
 
+#ifdef WASM_BUILD
+            /* Parallel SIMD path for Mandelbrot with simple coloring */
+            if (fractype_is_parallel_safe()) {
+                pworkers_start();
+                par_current_row = 0;
+                calcfrac_frame_count = 0;
+                wasm_state = WS_PAR_PRODUCE;
+                break;
+            }
+#endif
+
             /* Watchdog: if stuck too long, force a safe restart */
             if (++calcfrac_frame_count > calcfrac_watchdog) {
                 calcfrac_frame_count = 0;
@@ -906,6 +1175,75 @@ static void wasm_main_loop_callback(void)
         pan_strip_dir = 0;
         wasm_state = WS_INIT_VIDEO;
         break;
+
+#ifdef WASM_BUILD
+    case WS_PAR_PRODUCE:
+        /*
+         * Multi-frame producer: push one full row of pixels per callback
+         * invocation into the ring buffer.  Workers drain and compute
+         * concurrently.  Each row push is non-blocking (the queue holds
+         * PQUEUE_SIZE=4096 items, which comfortably fits one row at any
+         * supported resolution).
+         *
+         * y-coordinate formula mirrors dypixel_calc() in fractals.c:
+         *   cy = yymax - row * delyy - col * delyy2
+         * For standard (non-skewed) Mandelbrot, yy3rd == yymin so:
+         *   delyy  = (yymax - yy3rd) / (ydots-1) = (yymax - yymin) / (ydots-1)
+         *   delyy2 = (yy3rd - yymin) / (xdots-1) = 0
+         * Therefore: cy = yymax - row * (yymax - yymin) / (ydots - 1)
+         *
+         * x-coordinate mirrors dxpixel_calc():
+         *   cx = xxmin + col * delxx + row * delxx2
+         * For standard Mandelbrot: xx3rd == xxmin so delxx2 = 0, giving:
+         *   cx = xxmin + col * (xxmax - xxmin) / (xdots - 1)
+         */
+        {
+            double dx = (xdots > 1) ? (xxmax - xxmin) / (xdots - 1) : 0.0;
+            double dy = (ydots > 1) ? (yymax - yymin) / (ydots - 1) : 0.0;
+            int r = par_current_row;
+            double cy = yymax - r * dy;
+            int c;
+
+            if (restart_requested) {
+                pworkers_abort();
+                wasm_state = WS_INIT_VIDEO;
+                break;
+            }
+
+            /* Push one full row */
+            for (c = 0; c < xdots; c++) {
+                PixelWork pw;
+                pw.row = r;
+                pw.col = c;
+                pw.cx  = xxmin + c * dx;
+                pw.cy  = cy;
+                if (!pqueue_push(pw)) {
+                    /* aborted (restart_requested set during push) */
+                    pworkers_abort();
+                    wasm_state = WS_INIT_VIDEO;
+                    goto par_produce_done;
+                }
+            }
+
+            par_current_row++;
+            if (par_current_row >= ydots) {
+                /* All rows pushed — signal workers that production is done */
+                pworkers_finish();
+                writevideopalette();
+                calc_status = 4; /* mark as complete */
+                wasm_state = WS_DONE;
+            }
+            par_produce_done:;
+        }
+        break;
+
+    case WS_PAR_WAIT:
+        /* Fallthrough: pworkers_finish() is called inline at end of
+         * WS_PAR_PRODUCE, so WS_PAR_WAIT is not used in the current
+         * implementation.  Kept as a named state for future use. */
+        wasm_state = WS_DONE;
+        break;
+#endif /* WASM_BUILD */
     }
 }
 
@@ -1354,7 +1692,6 @@ double wasm_get_yymax(void) { return yymax; }
 EMSCRIPTEN_KEEPALIVE
 int wasm_get_maxit(void)
 {
-    extern long maxit;
     return (int)maxit;
 }
 
