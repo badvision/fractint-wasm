@@ -77,16 +77,15 @@ EM_FLAGS += -s FORCE_FILESYSTEM=1
 EM_FLAGS += -s ENVIRONMENT=web
 
 # -----------------------------------------------------------------------
-# ASYNCIFY: enables blocking C calls (waitkeypressed, menus) to yield to
-# the browser event loop.  This allows main_menu_switch() to call
-# waitkeypressed() deep in the call stack without hanging the browser.
-#
-# NOTE: ASYNCIFY and USE_PTHREADS are mutually exclusive in Emscripten.
-# We choose ASYNCIFY (menus) over pthreads (parallel SIMD rendering).
-# The parallel path falls back to serial under #ifdef __EMSCRIPTEN_PTHREADS__.
+# pthread support — enables SharedArrayBuffer-based Web Workers.
+# coi-serviceworker.min.js in web/ injects the required COOP/COEP headers
+# on static hosts (GitHub Pages) that don't allow custom HTTP headers.
+# PTHREAD_POOL_SIZE=4 pre-spawns 4 workers at startup (avoids first-use
+# latency); safe on M3 and most modern hardware.
 # -----------------------------------------------------------------------
-EM_FLAGS += -s ASYNCIFY=1
-EM_FLAGS += -s ASYNCIFY_STACK_SIZE=131072
+EM_FLAGS += -s USE_PTHREADS=1
+EM_FLAGS += -s PTHREAD_POOL_SIZE=4
+EM_FLAGS += -s SHARED_MEMORY=1
 
 # Preload data files when the directory is populated
 DATA_FILES := $(wildcard data/*)
