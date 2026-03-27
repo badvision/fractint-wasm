@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fractint — WebAssembly Fractal Explorer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌀</text></svg>">
+  <link rel="stylesheet" href="css/fractint.css">
+</head>
+<body>
+  <div id="app">
+    <div id="canvas-container">
+      <canvas id="canvas" tabindex="0"></canvas>
+      <div id="loading-overlay">
+        <div class="spinner"></div>
+        <div id="loading-text">Loading Fractint...</div>
+        <div id="progress-bar"><div id="progress-fill"></div></div>
+      </div>
+    </div>
+    <div id="controls-panel">
+      <div class="control-group">
+        <h3>Color Cycling</h3>
+        <button id="cycle-toggle">&#9654; Cycle</button>
+        <label>Speed <input type="range" id="cycle-speed" min="1" max="10" value="7"></label>
+        <button id="cycle-dir">&#8594; FWD</button>
+      </div>
+      <div class="control-group" id="fractal-type-group">
+        <h3>Fractal Type</h3>
+        <select id="fractal-type" title="Select fractal type">
+          <option value="4" selected>Mandelbrot (FP)</option>
+          <option value="0">Mandelbrot (int)</option>
+          <option value="6">Julia (FP)</option>
+          <option value="1">Julia (int)</option>
+          <option value="5">Newton</option>
+          <option value="2">Newton Basin</option>
+          <option value="68">Complex Newton</option>
+          <option value="74">Sierpinski (FP)</option>
+          <option value="12">Sierpinski (int)</option>
+          <option value="76">Barnsley M1 (FP)</option>
+          <option value="13">Barnsley M1 (int)</option>
+          <option value="63">Lorenz (FP)</option>
+          <option value="157">Marks Mandelbrot (FP)</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <h3>View</h3>
+        <button id="btn-reset">Reset View</button>
+        <button id="btn-zoom-in">+ Zoom In</button>
+        <button id="btn-zoom-out">- Zoom Out</button>
+        <button id="btn-save">Save Image</button>
+      </div>
+      <div class="help-hint">
+        <small>Click canvas for keyboard focus<br>
++/C = color cycle · PageUp/Down = zoom<br>
+Arrows = pan · Home = reset view</small>
+      </div>
+    </div>
+  </div>
+  <!--
+    Script load order is critical:
+    1. keyboard.js       — sets up key translation, pre-seeds Module
+    2. ui.js             — loading overlay, controls, extends Module hooks
+    3. fractint-wasm.js  — installs canvas renderer; MUST be before fractint.js
+    4. fractint.js       — Emscripten glue: calls Module.onRuntimeInitialized
+  -->
+  <script src="js/keyboard.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/fractint-wasm.js"></script>
+  <script src="fractint.js"></script>
+</body>
+</html>

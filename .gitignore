@@ -1,0 +1,11 @@
+# Build tarball — redundant with the extracted directory
+xfractint-20.04p16.tar.gz
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Editor
+.vscode/
+.idea/
