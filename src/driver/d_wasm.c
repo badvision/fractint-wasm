@@ -125,6 +125,14 @@ static volatile int restart_requested = 0;
 extern int keybuffer;
 
 /* ------------------------------------------------------------------ */
+/* Pending coordinate restore (for URL hash loading)                  */
+/* calcfracinit() resets coords to fractal defaults, so we apply the  */
+/* URL-supplied coords *after* calcfracinit() in WS_INIT_VIDEO.       */
+/* ------------------------------------------------------------------ */
+static int    pending_coords = 0;
+static double pending_xxmin, pending_xxmax, pending_yymin, pending_yymax;
+
+/* ------------------------------------------------------------------ */
 /* Key ring buffer (power-of-two size for fast masking)               */
 /* ------------------------------------------------------------------ */
 
@@ -697,6 +705,16 @@ static void wasm_main_loop_callback(void)
         calc_status = 0;
         showfile    = 1;
         calcfracinit();
+
+        /* Restore URL-supplied coordinates after calcfracinit() resets them */
+        if (pending_coords) {
+            xxmin = pending_xxmin;  xxmax = pending_xxmax;
+            yymin = pending_yymin;  yymax = pending_yymax;
+            xx3rd = xxmin;          yy3rd = yymin;
+            sxmin = xxmin;          sxmax = xxmax;
+            symin = yymin;          symax = yymax;
+            pending_coords = 0;
+        }
 
         wasm_state = WS_CALCFRAC;
         break;
@@ -1272,6 +1290,12 @@ int wasm_get_maxit(void)
 EMSCRIPTEN_KEEPALIVE
 void wasm_set_coords(double xmin, double xmax, double ymin, double ymax)
 {
+    /* Store as pending so they survive the calcfracinit() coord reset
+     * that happens at the start of every WS_INIT_VIDEO cycle. */
+    pending_xxmin  = xmin;  pending_xxmax  = xmax;
+    pending_yymin  = ymin;  pending_yymax  = ymax;
+    pending_coords = 1;
+
     restart_requested = 1;
     xxmin = xmin;  xxmax = xmax;
     yymin = ymin;  yymax = ymax;
