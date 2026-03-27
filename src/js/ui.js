@@ -16,6 +16,8 @@
   var wasmSetCycleSpeed = null;
   var wasmSetFractype   = null;
   var wasmGetFractype   = null;
+  var wasmZoomToRect    = null;
+  var wasmZoomAtPoint   = null;
 
   /* ---------------------------------------------------------------- */
   /* Loading progress feedback                                        */
@@ -70,9 +72,13 @@
       wasmSetCycleSpeed = Module.cwrap('wasm_set_cycle_speed', 'void', ['number']);
       wasmSetFractype   = Module.cwrap('wasm_set_fractype',    'void', ['number']);
       wasmGetFractype   = Module.cwrap('wasm_get_fractype',    'number', []);
+      wasmZoomToRect    = Module.cwrap('wasm_zoom_to_rect',    'void', ['number','number','number','number']);
+      wasmZoomAtPoint   = Module.cwrap('wasm_zoom_at_point',   'void', ['number','number','number']);
     } catch (e) {
       console.warn('[FractintUI] WASM controls not available:', e);
     }
+
+    initMouseZoom();
 
     if (prevOnInit) prevOnInit();
   };
@@ -181,4 +187,117 @@
       });
     }
   });
+
+  /* ---------------------------------------------------------------- */
+  /* Mouse zoom — initialised after WASM runtime is ready             */
+  /* ---------------------------------------------------------------- */
+
+  function initMouseZoom() {
+    var canvas = document.getElementById('canvas');
+    if (!canvas) return;
+    if (!wasmZoomToRect || !wasmZoomAtPoint) return;
+
+    var dragStart = null;
+
+    /* Overlay canvas for rubber-band zoom box */
+    var overlay = document.createElement('canvas');
+    overlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;';
+    overlay.id = 'zoom-overlay';
+    canvas.parentElement.appendChild(overlay);
+    var octx = overlay.getContext('2d');
+
+    function syncOverlay() {
+      overlay.width  = canvas.offsetWidth;
+      overlay.height = canvas.offsetHeight;
+    }
+    syncOverlay();
+
+    /* Map a MouseEvent to canvas pixel coordinates */
+    function canvasCoords(e) {
+      var rect   = canvas.getBoundingClientRect();
+      var scaleX = canvas.width  / rect.width;
+      var scaleY = canvas.height / rect.height;
+      return {
+        x: Math.round((e.clientX - rect.left) * scaleX),
+        y: Math.round((e.clientY - rect.top)  * scaleY)
+      };
+    }
+
+    function drawZoomBox(x1, y1, x2, y2) {
+      syncOverlay();
+      octx.clearRect(0, 0, overlay.width, overlay.height);
+      var sx = overlay.width  / canvas.width;
+      var sy = overlay.height / canvas.height;
+      octx.strokeStyle = 'rgba(255,255,255,0.9)';
+      octx.lineWidth   = 1.5;
+      octx.setLineDash([4, 4]);
+      octx.strokeRect(
+        x1 * sx, y1 * sy,
+        (x2 - x1) * sx, (y2 - y1) * sy
+      );
+    }
+
+    canvas.addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      dragStart = canvasCoords(e);
+    });
+
+    canvas.addEventListener('mousemove', function (e) {
+      if (!dragStart) return;
+      var cur = canvasCoords(e);
+      var x1 = Math.min(dragStart.x, cur.x);
+      var y1 = Math.min(dragStart.y, cur.y);
+      var x2 = Math.max(dragStart.x, cur.x);
+      var y2 = Math.max(dragStart.y, cur.y);
+      drawZoomBox(x1, y1, x2, y2);
+    });
+
+    canvas.addEventListener('mouseup', function (e) {
+      if (!dragStart) return;
+      var end = canvasCoords(e);
+      var dx  = Math.abs(end.x - dragStart.x);
+      var dy  = Math.abs(end.y - dragStart.y);
+
+      /* Clear overlay */
+      octx.clearRect(0, 0, overlay.width, overlay.height);
+
+      if (dx < 5 && dy < 5) {
+        /* Click: zoom in 2x centred on click point */
+        wasmZoomAtPoint(end.x, end.y, 0.5);
+      } else {
+        /* Drag: zoom to selected rectangle */
+        var x1 = Math.min(dragStart.x, end.x);
+        var y1 = Math.min(dragStart.y, end.y);
+        var x2 = Math.max(dragStart.x, end.x);
+        var y2 = Math.max(dragStart.y, end.y);
+        wasmZoomToRect(x1, y1, x2, y2);
+      }
+      dragStart = null;
+    });
+
+    /* Cancel drag if mouse leaves the canvas */
+    canvas.addEventListener('mouseleave', function () {
+      if (dragStart) {
+        octx.clearRect(0, 0, overlay.width, overlay.height);
+        dragStart = null;
+      }
+    });
+
+    /* Right-click: zoom out 2x */
+    canvas.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      var pos = canvasCoords(e);
+      wasmZoomAtPoint(pos.x, pos.y, 2.0);
+    });
+
+    /* Scroll wheel: zoom in/out at cursor */
+    canvas.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var pos    = canvasCoords(e);
+      var factor = e.deltaY > 0 ? 2.0 : 0.5;
+      wasmZoomAtPoint(pos.x, pos.y, factor);
+    }, { passive: false });
+  }
+
 }());

@@ -58,10 +58,11 @@ int unixDisk    = 0;
 
 /* videotable[] is defined (and initialized) in unix/video.c */
 
-/* Screen pixel buffer — 8-bit palette indices */
+/* Screen pixel buffer — 8-bit palette indices, dynamically allocated */
 static BYTE *screen_pixels = NULL;
 static int screen_w = 0;
 static int screen_h = 0;
+static int pixel_buf_size = 0;
 
 /*
  * rgba_lut[i] = RGBA for palette index i.
@@ -106,8 +107,12 @@ static int key_pop(void)
 
 static void ensure_screen_buffer(void)
 {
-    if (screen_pixels == NULL && screen_w > 0 && screen_h > 0) {
-        screen_pixels = (BYTE *)calloc((size_t)(screen_w * screen_h), 1);
+    int needed = screen_w * screen_h;
+    if (needed <= 0) return;
+    if (screen_pixels == NULL || needed != pixel_buf_size) {
+        free(screen_pixels);
+        screen_pixels = (BYTE *)calloc((size_t)needed, 1);
+        pixel_buf_size = screen_pixels ? needed : 0;
     }
 }
 
@@ -663,6 +668,115 @@ EMSCRIPTEN_KEEPALIVE
 int wasm_get_fractype(void)
 {
     return fractype;
+}
+
+/*
+ * wasm_resize — JS calls this when the canvas container changes size.
+ * Reallocates the pixel buffer, updates Fractint globals sxdots/sydots,
+ * and triggers a full recalculation from WS_INIT_VIDEO.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_resize(int width, int height)
+{
+    /* Clamp to reasonable bounds */
+    if (width  < 320)  width  = 320;
+    if (height < 240)  height = 240;
+    if (width  > 3840) width  = 3840;
+    if (height > 2160) height = 2160;
+
+    screen_w = width;
+    screen_h = height;
+
+    /* Reallocate pixel buffer to match new dimensions */
+    ensure_screen_buffer();
+    if (!screen_pixels) return;
+
+    /* Update Fractint globals */
+    sxdots = width;
+    sydots  = height;
+    xdots   = sxdots;
+    ydots   = sydots;
+
+    videotable[0].xdots = sxdots;
+    videotable[0].ydots = sydots;
+
+    /* Trigger full reinitialisation */
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
+}
+
+/*
+ * wasm_zoom_to_rect — zoom into the pixel rectangle (px1,py1)-(px2,py2).
+ * Coordinates are in canvas pixel space; the function normalises them so
+ * px1 < px2 and py1 < py2 regardless of drag direction.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_zoom_to_rect(int px1, int py1, int px2, int py2)
+{
+    double dx, dy, new_xmin, new_xmax, new_ymin, new_ymax;
+    int tmp;
+
+    if (screen_w <= 0 || screen_h <= 0) return;
+
+    /* Normalise so px1 <= px2, py1 <= py2 */
+    if (px1 > px2) { tmp = px1; px1 = px2; px2 = tmp; }
+    if (py1 > py2) { tmp = py1; py1 = py2; py2 = tmp; }
+
+    /* Guard against zero-size box */
+    if (px2 <= px1 || py2 <= py1) return;
+
+    dx = xxmax - xxmin;
+    dy = yymax - yymin;
+
+    new_xmin = xxmin + (dx * px1) / screen_w;
+    new_xmax = xxmin + (dx * px2) / screen_w;
+    /* Canvas y=0 is top; fractal y increases upward */
+    new_ymax = yymax - (dy * py1) / screen_h;
+    new_ymin = yymax - (dy * py2) / screen_h;
+
+    xxmin = new_xmin;
+    xxmax = new_xmax;
+    yymin = new_ymin;
+    yymax = new_ymax;
+    xx3rd = xxmin;
+    yy3rd = yymin;
+
+    sxmin = xxmin; sxmax = xxmax;
+    symin = yymin; symax = yymax;
+
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
+}
+
+/*
+ * wasm_zoom_at_point — zoom centred on pixel (px, py) by the given factor.
+ * factor < 1.0 zooms in (e.g. 0.5 = 2x); factor > 1.0 zooms out.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_zoom_at_point(int px, int py, double factor)
+{
+    double cx, cy, hw, hh;
+
+    if (screen_w <= 0 || screen_h <= 0) return;
+
+    cx = xxmin + (xxmax - xxmin) * px / screen_w;
+    cy = yymax - (yymax - yymin) * py / screen_h;
+
+    hw = (xxmax - xxmin) * factor * 0.5;
+    hh = (yymax - yymin) * factor * 0.5;
+
+    xxmin = cx - hw;
+    xxmax = cx + hw;
+    yymin = cy - hh;
+    yymax = cy + hh;
+    xx3rd = xxmin;
+    yy3rd = yymin;
+
+    sxmin = xxmin; sxmax = xxmax;
+    symin = yymin; symax = yymax;
+
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
 }
 
 /* ------------------------------------------------------------------ */

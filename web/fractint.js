@@ -26,7 +26,7 @@ var ENVIRONMENT_IS_SHELL = false;
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: /var/folders/mb/m1xnxfmd19d1nhvxn_90llbh0000gn/T/tmp84k4kxl_.js
+// include: /var/folders/mb/m1xnxfmd19d1nhvxn_90llbh0000gn/T/tmpqk66aui5.js
 
   if (!Module['expectedDataFileDownloads']) Module['expectedDataFileDownloads'] = 0;
   Module['expectedDataFileDownloads']++;
@@ -155,7 +155,7 @@ Module['FS_createPath']("/", "data", true, true);
 
   })();
 
-// end include: /var/folders/mb/m1xnxfmd19d1nhvxn_90llbh0000gn/T/tmp84k4kxl_.js
+// end include: /var/folders/mb/m1xnxfmd19d1nhvxn_90llbh0000gn/T/tmpqk66aui5.js
 
 
 var arguments_ = [];
@@ -4850,6 +4850,9 @@ var _main,
   _wasm_set_cycle_speed,
   _wasm_set_fractype,
   _wasm_get_fractype,
+  _wasm_resize,
+  _wasm_zoom_to_rect,
+  _wasm_zoom_at_point,
   __emscripten_stack_restore,
   __emscripten_stack_alloc,
   _emscripten_stack_get_current,
@@ -4870,6 +4873,9 @@ function assignWasmExports(wasmExports) {
   _wasm_set_cycle_speed = Module['_wasm_set_cycle_speed'] = wasmExports['wasm_set_cycle_speed'];
   _wasm_set_fractype = Module['_wasm_set_fractype'] = wasmExports['wasm_set_fractype'];
   _wasm_get_fractype = Module['_wasm_get_fractype'] = wasmExports['wasm_get_fractype'];
+  _wasm_resize = Module['_wasm_resize'] = wasmExports['wasm_resize'];
+  _wasm_zoom_to_rect = Module['_wasm_zoom_to_rect'] = wasmExports['wasm_zoom_to_rect'];
+  _wasm_zoom_at_point = Module['_wasm_zoom_at_point'] = wasmExports['wasm_zoom_at_point'];
   __emscripten_stack_restore = wasmExports['_emscripten_stack_restore'];
   __emscripten_stack_alloc = wasmExports['_emscripten_stack_alloc'];
   _emscripten_stack_get_current = wasmExports['emscripten_stack_get_current'];

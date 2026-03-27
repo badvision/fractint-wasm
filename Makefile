@@ -69,7 +69,7 @@ EM_FLAGS  = -s USE_SDL=2
 EM_FLAGS += -s ALLOW_MEMORY_GROWTH=1
 EM_FLAGS += -s INITIAL_MEMORY=33554432
 EM_FLAGS += -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","HEAPU32"]'
-EM_FLAGS += -s EXPORTED_FUNCTIONS='["_main","_wasm_push_key","_wasm_get_pixel_buf","_wasm_get_rgba_lut","_wasm_get_screen_dims","_wasm_toggle_cycle","_wasm_set_cycle_speed","_wasm_set_fractype","_wasm_get_fractype"]'
+EM_FLAGS += -s EXPORTED_FUNCTIONS='["_main","_wasm_push_key","_wasm_get_pixel_buf","_wasm_get_rgba_lut","_wasm_get_screen_dims","_wasm_toggle_cycle","_wasm_set_cycle_speed","_wasm_set_fractype","_wasm_get_fractype","_wasm_resize","_wasm_zoom_to_rect","_wasm_zoom_at_point"]'
 EM_FLAGS += -s FORCE_FILESYSTEM=1
 EM_FLAGS += -s ENVIRONMENT=web
 

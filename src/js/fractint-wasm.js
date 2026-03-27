@@ -86,6 +86,7 @@ window.Module = window.Module || {};
     var getPixelBuf   = M.cwrap('wasm_get_pixel_buf',   'number', []);
     var getRgbaLut    = M.cwrap('wasm_get_rgba_lut',    'number', []);
     var getScreenDims = M.cwrap('wasm_get_screen_dims', 'number', []);
+    var wasmResize    = M.cwrap('wasm_resize',           'void',   ['number', 'number']);
 
     var canvas = document.getElementById('canvas');
     var ctx = canvas.getContext('2d');
@@ -149,6 +150,41 @@ window.Module = window.Module || {};
     }
 
     requestAnimationFrame(renderFrame);
+
+    /* ---------------------------------------------------------------- */
+    /* Dynamic canvas resize via ResizeObserver                         */
+    /* ---------------------------------------------------------------- */
+
+    var resizeCanvas = function () {
+      var container = document.getElementById('canvas-container');
+      if (!container) return;
+      var w = container.clientWidth;
+      var h = container.clientHeight;
+      /* Snap to even numbers */
+      w = Math.floor(w / 2) * 2;
+      h = Math.floor(h / 2) * 2;
+      if (w < 320 || h < 240) return;
+      /* canvas.width/height are already synced by the render loop
+       * when WASM reports new dims, but we must tell WASM the new size. */
+      wasmResize(w, h);
+    };
+
+    /* Initial resize to fill the container */
+    resizeCanvas();
+
+    if (window.ResizeObserver) {
+      var ro = new ResizeObserver(function () {
+        clearTimeout(window._fractintResizeTimer);
+        window._fractintResizeTimer = setTimeout(resizeCanvas, 150);
+      });
+      var container = document.getElementById('canvas-container');
+      if (container) ro.observe(container);
+    } else {
+      window.addEventListener('resize', function () {
+        clearTimeout(window._fractintResizeTimer);
+        window._fractintResizeTimer = setTimeout(resizeCanvas, 150);
+      });
+    }
   };
 
 }(window.Module));
