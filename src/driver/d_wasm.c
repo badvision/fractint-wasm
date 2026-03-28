@@ -888,8 +888,11 @@ static int cycle_dir = 1;
 static int cycle_skip_counter = 0;
 static int cycle_skip_max     = 1;
 
-/* Forward declaration for wasm_toggle_cycle (defined later in this file) */
+/* Forward declarations for functions defined later in this file */
 void wasm_toggle_cycle(int dir);
+#ifdef WASM_BUILD
+void wasm_open_menu(int key);
+#endif
 
 /* Fractint internals used by the loop */
 extern void calcfracinit(void);
@@ -1219,14 +1222,25 @@ static void wasm_main_loop_callback(void)
                     case 's':    /* save — ignore (PNG save is in JS) */
                     case 'd':    /* shell — ignore */
                         break;
-                    case 'z':    /* zoom params — ignore gracefully */
-                    case 'x':    /* extended params — ignore */
-                    case 'y':    /* more params — ignore */
+                    case 'z':    /* zoom params */
+                    case 'x':    /* extended params */
+                    case 'y':    /* more params */
+#ifdef WASM_BUILD
+                        wasm_open_menu(key);
+#endif
+                        break;
                     case '@':    /* batch file — ignore */
                         break;
-                    /* 't'/'T' fractal type — ignore; type picker is in the JS dropdown */
+                    case ' ':    /* SPACE — Mandel/Julia toggle via menu */
+#ifdef WASM_BUILD
+                        wasm_open_menu(' ');
+#endif
+                        break;
                     case 't':
                     case 'T':
+#ifdef WASM_BUILD
+                        wasm_open_menu('t');
+#endif
                         break;
                     default:
                         /* Truly unknown — do nothing, stay in WS_DONE */
@@ -1454,6 +1468,12 @@ void wasm_toggle_cycle(int dir)
         if (dir != 0) cycle_dir = dir;
         wasm_state = WS_COLOR_CYCLE;
     }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_is_cycling(void)
+{
+    return wasm_state == WS_COLOR_CYCLE ? 1 : 0;
 }
 
 /*

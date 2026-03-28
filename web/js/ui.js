@@ -13,6 +13,7 @@
 
   /* Direct WASM function handles — set up after runtime is ready */
   var wasmToggleCycle   = null;
+  var wasmIsCycling     = null;
   var wasmSetCycleSpeed = null;
   var wasmSetFractype   = null;
   var wasmGetFractype   = null;
@@ -76,6 +77,7 @@
     /* Wire up direct WASM controls */
     try {
       wasmToggleCycle    = Module.cwrap('wasm_toggle_cycle',     'void', ['number']);
+      wasmIsCycling      = Module.cwrap('wasm_is_cycling',       'number', []);
       wasmSetCycleSpeed  = Module.cwrap('wasm_set_cycle_speed',  'void', ['number']);
       wasmSetFractype    = Module.cwrap('wasm_set_fractype',     'void', ['number']);
       wasmGetFractype    = Module.cwrap('wasm_get_fractype',     'number', []);
@@ -136,13 +138,19 @@
         if (wasmToggleCycle) {
           /* Pass direction when starting, 0 when stopping */
           wasmToggleCycle(cycleActive ? 0 : cycleDir);
+          /* Resync JS state from C truth (prevents inversion on interrupted cycles) */
+          if (wasmIsCycling) {
+            cycleActive = !!wasmIsCycling();
+          } else {
+            cycleActive = !cycleActive;
+          }
         } else {
           /* Fallback: key injection if WASM not yet ready */
           if (window.FractintKeyboard) {
             window.FractintKeyboard.pushKey('c'.charCodeAt(0));
           }
+          cycleActive = !cycleActive;
         }
-        cycleActive = !cycleActive;
         this.textContent = cycleActive ? '\u25A0 Stop' : '\u25BA Cycle';
         this.classList.toggle('active', cycleActive);
         if (btnDir) {
