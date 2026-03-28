@@ -18,6 +18,11 @@
   var wasmGetFractype   = null;
   var wasmZoomToRect    = null;
   var wasmZoomAtPoint   = null;
+  var wasmSetMaxit         = null;
+  var wasmSetInside        = null;
+  var wasmSetOutside       = null;
+  var wasmSetJuliaParams   = null;
+  var wasmSetPalettePreset = null;
 
   /* ---------------------------------------------------------------- */
   /* Loading progress feedback                                        */
@@ -68,12 +73,17 @@
 
     /* Wire up direct WASM controls */
     try {
-      wasmToggleCycle   = Module.cwrap('wasm_toggle_cycle',    'void', ['number']);
-      wasmSetCycleSpeed = Module.cwrap('wasm_set_cycle_speed', 'void', ['number']);
-      wasmSetFractype   = Module.cwrap('wasm_set_fractype',    'void', ['number']);
-      wasmGetFractype   = Module.cwrap('wasm_get_fractype',    'number', []);
-      wasmZoomToRect    = Module.cwrap('wasm_zoom_to_rect',    'void', ['number','number','number','number']);
-      wasmZoomAtPoint   = Module.cwrap('wasm_zoom_at_point',   'void', ['number','number','number']);
+      wasmToggleCycle    = Module.cwrap('wasm_toggle_cycle',     'void', ['number']);
+      wasmSetCycleSpeed  = Module.cwrap('wasm_set_cycle_speed',  'void', ['number']);
+      wasmSetFractype    = Module.cwrap('wasm_set_fractype',     'void', ['number']);
+      wasmGetFractype    = Module.cwrap('wasm_get_fractype',     'number', []);
+      wasmZoomToRect     = Module.cwrap('wasm_zoom_to_rect',     'void', ['number','number','number','number']);
+      wasmZoomAtPoint    = Module.cwrap('wasm_zoom_at_point',    'void', ['number','number','number']);
+      wasmSetMaxit         = Module.cwrap('wasm_set_maxit',          'void', ['number']);
+      wasmSetInside        = Module.cwrap('wasm_set_inside',         'void', ['number']);
+      wasmSetOutside       = Module.cwrap('wasm_set_outside',        'void', ['number']);
+      wasmSetJuliaParams   = Module.cwrap('wasm_set_julia_params',   'void', ['number','number']);
+      wasmSetPalettePreset = Module.cwrap('wasm_set_palette_preset', 'void', ['number']);
     } catch (e) {
       console.warn('[FractintUI] WASM controls not available:', e);
     }
@@ -89,14 +99,22 @@
 
   document.addEventListener('DOMContentLoaded', function () {
 
-    var btnCycle     = document.getElementById('cycle-toggle');
-    var btnDir       = document.getElementById('cycle-dir');
-    var speedIn      = document.getElementById('cycle-speed');
-    var btnReset     = document.getElementById('btn-reset');
-    var btnZoomIn    = document.getElementById('btn-zoom-in');
-    var btnZoomOut   = document.getElementById('btn-zoom-out');
-    var btnSave      = document.getElementById('btn-save');
+    var btnCycle       = document.getElementById('cycle-toggle');
+    var btnDir         = document.getElementById('cycle-dir');
+    var speedIn        = document.getElementById('cycle-speed');
+    var btnReset       = document.getElementById('btn-reset');
+    var btnZoomIn      = document.getElementById('btn-zoom-in');
+    var btnZoomOut     = document.getElementById('btn-zoom-out');
+    var btnSave        = document.getElementById('btn-save');
     var fracTypeSelect = document.getElementById('fractal-type');
+    var palettePreset  = document.getElementById('palette-preset');
+    var paramMaxit     = document.getElementById('param-maxit');
+    var paramInside    = document.getElementById('param-inside');
+    var paramOutside   = document.getElementById('param-outside');
+    var juliaGroup     = document.getElementById('julia-params-group');
+    var paramJuliaRe   = document.getElementById('param-julia-re');
+    var paramJuliaIm   = document.getElementById('param-julia-im');
+    var btnApplyJulia  = document.getElementById('btn-apply-julia');
     /* btn-share is wired in urlshare.js after WASM init */
 
     if (speedIn) {
@@ -165,6 +183,15 @@
       });
     }
 
+    /* Julia fractal type indices — show seed panel for these */
+    var JULIA_TYPES = { 1: true, 6: true, 108: true, 109: true };
+
+    function updateJuliaPanel() {
+      if (!juliaGroup || !fracTypeSelect) return;
+      var type = parseInt(fracTypeSelect.value, 10);
+      juliaGroup.style.display = JULIA_TYPES[type] ? '' : 'none';
+    }
+
     if (fracTypeSelect) {
       fracTypeSelect.addEventListener('change', function () {
         var type = parseInt(this.value, 10);
@@ -174,6 +201,55 @@
         } else if (typeof Module !== 'undefined' && Module.ccall) {
           Module.ccall('wasm_set_fractype', 'void', ['number'], [type]);
         }
+        updateJuliaPanel();
+        /* Auto-apply Julia seed defaults when switching to a Julia type */
+        if (JULIA_TYPES[type] && wasmSetJuliaParams && paramJuliaRe && paramJuliaIm) {
+          var re = parseFloat(paramJuliaRe.value);
+          var im = parseFloat(paramJuliaIm.value);
+          if (!isNaN(re) && !isNaN(im)) {
+            wasmSetJuliaParams(re, im);
+          }
+        }
+      });
+      updateJuliaPanel();
+    }
+
+    if (palettePreset) {
+      palettePreset.addEventListener('change', function () {
+        var p = parseInt(this.value, 10);
+        if (wasmSetPalettePreset) wasmSetPalettePreset(p);
+      });
+    }
+
+    if (paramMaxit) {
+      paramMaxit.addEventListener('change', function () {
+        var n = parseInt(this.value, 10);
+        if (isNaN(n)) return;
+        if (wasmSetMaxit) wasmSetMaxit(n);
+      });
+    }
+
+    if (paramInside) {
+      paramInside.addEventListener('change', function () {
+        var mode = parseInt(this.value, 10);
+        if (wasmSetInside) wasmSetInside(mode);
+      });
+    }
+
+    if (paramOutside) {
+      paramOutside.addEventListener('change', function () {
+        var mode = parseInt(this.value, 10);
+        if (wasmSetOutside) wasmSetOutside(mode);
+      });
+    }
+
+    if (btnApplyJulia) {
+      btnApplyJulia.addEventListener('click', function () {
+        var re = parseFloat(paramJuliaRe ? paramJuliaRe.value : '-0.7');
+        var im = parseFloat(paramJuliaIm ? paramJuliaIm.value : '0.27015');
+        if (isNaN(re) || isNaN(im)) return;
+        if (window.FractintShare) window.FractintShare.pushHistoryState();
+        if (wasmSetJuliaParams) wasmSetJuliaParams(re, im);
       });
     }
 
@@ -188,6 +264,36 @@
         }
       });
     }
+
+    /* Sync UI controls when fractal state is restored from URL hash */
+    window.addEventListener('fractinstaterestored', function (e) {
+      var p = e.detail;
+      if (!p) return;
+      /* Sync maxit input */
+      if (paramMaxit && typeof p.i === 'number') {
+        paramMaxit.value = p.i;
+      }
+      /* Sync inside select */
+      if (paramInside && typeof p.in === 'number') {
+        paramInside.value = String(p.in);
+      }
+      /* Sync outside select */
+      if (paramOutside && typeof p.out === 'number') {
+        paramOutside.value = String(p.out);
+      }
+      /* Sync fractal type select and Julia panel visibility */
+      if (fracTypeSelect && typeof p.t === 'number') {
+        fracTypeSelect.value = String(p.t);
+        updateJuliaPanel();
+      }
+      /* Sync Julia seed inputs */
+      if (paramJuliaRe && typeof p.p0 === 'number') {
+        paramJuliaRe.value = p.p0;
+      }
+      if (paramJuliaIm && typeof p.p1 === 'number') {
+        paramJuliaIm.value = p.p1;
+      }
+    });
   });
 
   /* ---------------------------------------------------------------- */

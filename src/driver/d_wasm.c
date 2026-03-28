@@ -23,6 +23,7 @@
 #ifdef WASM_BUILD
 #include <pthread.h>
 #include <wasm_simd128.h>
+#include "wasm_key.h"
 #endif
 
 /* SDL2 via Emscripten -s USE_SDL=2 */
@@ -76,6 +77,22 @@ int unixDisk    = 0;
 static uint16_t text_buf[TEXT_ROWS * TEXT_COLS];
 static int text_mode_active = 0;
 static int text_buf_dirty   = 0;
+
+#ifdef WASM_BUILD
+/* Double-buffer: menu thread writes to text_buf_back; main thread publishes
+ * to text_buf via text_buf_flush() under a generation counter so JS can
+ * detect torn reads. */
+static uint16_t text_buf_back[TEXT_ROWS * TEXT_COLS];
+static _Atomic int text_buf_gen = 0;
+
+static void text_buf_flush(void)
+{
+    atomic_fetch_add(&text_buf_gen, 1);   /* odd = write in progress */
+    memcpy(text_buf, text_buf_back, sizeof(text_buf));
+    atomic_fetch_add(&text_buf_gen, 1);   /* even = stable */
+    text_buf_dirty = 1;
+}
+#endif /* WASM_BUILD */
 
 /* Screen pixel buffer — 8-bit palette indices, dynamically allocated */
 static BYTE *screen_pixels = NULL;
@@ -131,12 +148,18 @@ static volatile int restart_requested = 0;
 extern int keybuffer;
 
 /* ------------------------------------------------------------------ */
-/* Pending coordinate restore (for URL hash loading)                  */
-/* calcfracinit() resets coords to fractal defaults, so we apply the  */
-/* URL-supplied coords *after* calcfracinit() in WS_INIT_VIDEO.       */
+/* Pending parameter restore                                          */
+/* calcfracinit() resets coords *and* maxit to fractal defaults, so   */
+/* we apply JS-supplied values *after* calcfracinit() in WS_INIT_VIDEO.*/
 /* ------------------------------------------------------------------ */
 static int    pending_coords = 0;
 static double pending_xxmin, pending_xxmax, pending_yymin, pending_yymax;
+
+static int  pending_maxit = 0;
+static long pending_maxit_val = 0;
+
+static int  pending_inside = 0;
+static int  pending_inside_val = 1;
 
 /* ------------------------------------------------------------------ */
 /* Key ring buffer (power-of-two size for fast masking)               */
@@ -146,6 +169,12 @@ static double pending_xxmin, pending_xxmax, pending_yymin, pending_yymax;
 static int key_ring[KEY_BUF_SIZE];
 static int key_head = 0;
 static int key_tail = 0;
+
+#ifdef WASM_BUILD
+/* Menu key channel and active flag — defined here, declared in wasm_key.h */
+KeyChannel menu_chan;
+_Atomic int wasm_menu_active = 0;
+#endif
 
 static void key_push(int keycode)
 {
@@ -406,6 +435,17 @@ unsigned char *xgetfont(void)
  */
 int xgetkey(int block)
 {
+#ifdef WASM_BUILD
+    /* When the menu pthread is active, route through KeyChannel.
+     * block=1 means the menu is waiting for input — block until a key arrives.
+     * block=0 is a poll — return 0 if nothing is ready. */
+    if (atomic_load(&wasm_menu_active)) {
+        if (block)
+            return key_channel_pop_blocking(&menu_chan);
+        else
+            return key_channel_pop_nowait(&menu_chan);
+    }
+#endif
     (void)block;
     if (restart_requested) {
         return 27; /* ESC — causes calcfract() to abort cleanly */
@@ -421,6 +461,12 @@ int xgetkey(int block)
 EMSCRIPTEN_KEEPALIVE
 void wasm_push_key(int keycode)
 {
+#ifdef WASM_BUILD
+    if (atomic_load(&wasm_menu_active)) {
+        key_channel_push(&menu_chan, keycode);
+        return;
+    }
+#endif
     key_push(keycode);
 }
 
@@ -494,10 +540,22 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t  not_empty;
     pthread_cond_t  not_full;
-    volatile int    done;    /* producer sets to 1 when finished pushing */
-    volatile int    abort;   /* set to 1 to stop all workers */
+    volatile int    done;            /* producer sets to 1 when finished pushing */
+    volatile int    abort;           /* set to 1 to stop all workers */
+    volatile int    workers_running; /* decremented by each worker on exit */
 } PixelQueue;
 
+/* Snapshot of rendering parameters captured at pworkers_start().
+ * Workers read these instead of the global variables so a mid-flight
+ * wasm_set_maxit() / wasm_set_inside() can't corrupt an in-progress frame. */
+typedef struct {
+    long  maxit;
+    int   inside;
+    int   colors;
+    int   scr_w;
+} PWorkerCtx;
+
+static PWorkerCtx pworker_ctx;
 static PixelQueue pqueue;
 static pthread_t  pworkers[PQUEUE_THREADS];
 
@@ -557,24 +615,23 @@ static int pqueue_pop2(PixelWork *out)
  *   escaped:  color = ((iter - 1) % (colors - 1)) + 1   [skips color 0]
  *   inside:   coloriter = inside (1), color = 1          [direct]
  */
-static int iter_to_color(long iter, long max_iter)
+static int iter_to_color(long iter, const PWorkerCtx *ctx)
 {
-    if (iter >= max_iter) {
+    if (iter >= ctx->maxit) {
         /* Inside point — use inside color (default 1 = blue) */
-        int c = (inside >= 0) ? inside : 0;
+        int c = (ctx->inside >= 0) ? ctx->inside : 0;
         if (c == 0) return 0;
-        return c % colors;
+        return c % ctx->colors;
     }
     if (iter == 0) iter = 1; /* match Fractint: coloriter==0 becomes 1 */
     /* Escaped: skip color 0; cycle through colors 1..255 */
-    return (int)(((iter - 1) % (colors - 1)) + 1);
+    return (int)(((iter - 1) % (ctx->colors - 1)) + 1);
 }
 
 static void *pworker_func(void *arg)
 {
+    const PWorkerCtx *ctx = (const PWorkerCtx *)arg;
     PixelWork items[2];
-
-    (void)arg;
 
     while (!pqueue.abort) {
         int n = pqueue_pop2(items);
@@ -586,13 +643,13 @@ static void *pworker_func(void *arg)
             v128_t ci = wasm_f64x2_make(items[0].cy, items[1].cy);
             v128_t zr = wasm_f64x2_splat(0.0);
             v128_t zi = wasm_f64x2_splat(0.0);
-            v128_t bailout = wasm_f64x2_splat(4.0);
+            v128_t bail = wasm_f64x2_splat(4.0);
             /* iteration counts as doubles for lane accumulation */
             v128_t iters  = wasm_f64x2_splat(0.0);
             v128_t one    = wasm_f64x2_splat(1.0);
             v128_t active = wasm_f64x2_splat(1.0); /* 1.0 = still iterating */
 
-            long limit = maxit;
+            long limit = ctx->maxit;
             long i;
             for (i = 0; i < limit; i++) {
                 v128_t zr2  = wasm_f64x2_mul(zr, zr);
@@ -600,7 +657,7 @@ static void *pworker_func(void *arg)
                 v128_t mag2 = wasm_f64x2_add(zr2, zi2);
 
                 /* lanes still within bailout radius */
-                v128_t still_in = wasm_f64x2_le(mag2, bailout);
+                v128_t still_in = wasm_f64x2_le(mag2, bail);
                 /* active = active AND still_in (keeps 1.0 only for unlaunched) */
                 active = wasm_v128_and(active, still_in);
                 /* count iterations only for active lanes */
@@ -623,18 +680,18 @@ static void *pworker_func(void *arg)
             long iter0 = (long)wasm_f64x2_extract_lane(iters, 0);
             long iter1 = (long)wasm_f64x2_extract_lane(iters, 1);
 
-            /* Write pixels directly to screen buffer */
-            int c0 = iter_to_color(iter0, limit);
-            int c1 = iter_to_color(iter1, limit);
-            screen_pixels[items[0].row * screen_w + items[0].col] = (unsigned char)c0;
-            screen_pixels[items[1].row * screen_w + items[1].col] = (unsigned char)c1;
+            /* Write pixels using snapshotted scr_w (not the global) */
+            int c0 = iter_to_color(iter0, ctx);
+            int c1 = iter_to_color(iter1, ctx);
+            screen_pixels[items[0].row * ctx->scr_w + items[0].col] = (unsigned char)c0;
+            screen_pixels[items[1].row * ctx->scr_w + items[1].col] = (unsigned char)c1;
 
         } else {
             /* n == 1: scalar path for odd last pixel */
             double czr = items[0].cx, czi = items[0].cy;
             double pzr = 0.0, pzi = 0.0;
             long iter = 0;
-            long limit = maxit;
+            long limit = ctx->maxit;
             for (; iter < limit; iter++) {
                 double r2 = pzr * pzr;
                 double i2 = pzi * pzi;
@@ -643,37 +700,59 @@ static void *pworker_func(void *arg)
                 pzi = 2.0 * pzr * pzi + czi;
                 pzr = nr;
             }
-            screen_pixels[items[0].row * screen_w + items[0].col] =
-                (unsigned char)iter_to_color(iter, maxit);
+            screen_pixels[items[0].row * ctx->scr_w + items[0].col] =
+                (unsigned char)iter_to_color(iter, ctx);
         }
     }
+    pthread_mutex_lock(&pqueue.lock);
+    pqueue.workers_running--;
+    pthread_mutex_unlock(&pqueue.lock);
     return NULL;
 }
 
 static void pworkers_start(void)
 {
     int i;
+    /* Snapshot globals that workers must not read live */
+    pworker_ctx.maxit  = maxit;
+    pworker_ctx.inside = inside;
+    pworker_ctx.colors = colors;
+    pworker_ctx.scr_w  = screen_w;
     pqueue_init();
-    pqueue.done  = 0;
-    pqueue.abort = 0;
-    pqueue.head  = 0;
-    pqueue.tail  = 0;
+    pqueue.done            = 0;
+    pqueue.abort           = 0;
+    pqueue.head            = 0;
+    pqueue.tail            = 0;
+    pqueue.workers_running = PQUEUE_THREADS;
     for (i = 0; i < PQUEUE_THREADS; i++) {
-        pthread_create(&pworkers[i], NULL, pworker_func, NULL);
+        pthread_create(&pworkers[i], NULL, pworker_func, &pworker_ctx);
     }
 }
 
-static void pworkers_finish(void)
+/*
+ * pworkers_signal_done — signal workers that no more items will be pushed,
+ * without joining.  Workers will drain the queue and exit on their own.
+ * WS_PAR_WAIT polls workers_running until it reaches 0, then joins
+ * (instantly, since the threads have already exited).
+ */
+static void pworkers_signal_done(void)
 {
-    int i;
     pthread_mutex_lock(&pqueue.lock);
     pqueue.done = 1;
     pthread_cond_broadcast(&pqueue.not_empty);
     pthread_mutex_unlock(&pqueue.lock);
+}
+
+/*
+ * pworkers_join — join all worker threads after they have exited.
+ * Called only from WS_PAR_WAIT after workers_running reaches 0.
+ */
+static void pworkers_join(void)
+{
+    int i;
     for (i = 0; i < PQUEUE_THREADS; i++) {
         pthread_join(pworkers[i], NULL);
     }
-    frame_dirty = 1;
 }
 
 static void pworkers_abort(void)
@@ -687,6 +766,7 @@ static void pworkers_abort(void)
     for (i = 0; i < PQUEUE_THREADS; i++) {
         pthread_join(pworkers[i], NULL);
     }
+    pqueue.workers_running = 0; /* mark as fully cleaned up */
 }
 
 /*
@@ -715,6 +795,51 @@ static int fractype_is_parallel_safe(void)
 /* Current row being pushed by the producer (WS_PAR_PRODUCE) */
 static int par_current_row = 0;
 
+/* ------------------------------------------------------------------ */
+/* Menu pthread (WS_MENU)                                             */
+/* ------------------------------------------------------------------ */
+
+/* IMAGESTART=2, RESTORESTART=3, RESTART=1, CONTINUE=4 from fractint.h */
+#include "fractint.h"
+
+typedef struct { int trigger_key; } MenuThreadArg;
+static MenuThreadArg menu_thread_arg;
+static pthread_t     menu_thread_id;
+static _Atomic int   menu_done = 0;
+static int           menu_result  = 0;
+static int           menu_kbdchar = 0;
+
+/* Fractint menu functions (declared in prototyp.h, already included above) */
+
+static void *menu_thread_func(void *arg)
+{
+    MenuThreadArg *marg = (MenuThreadArg *)arg;
+    int kbdmore    = 1;
+    int frommandel = 0;
+    char stacked[4] = {0};
+    int kbdchar    = marg->trigger_key;
+    int mms_value  = CONTINUE;
+
+    stackscreen();
+
+    do {
+        mms_value = main_menu_switch(&kbdchar, &frommandel,
+                                     &kbdmore, stacked, 0);
+        if (mms_value == CONTINUE && kbdmore) {
+            kbdchar = getakey();
+        }
+    } while (mms_value == CONTINUE && kbdmore);
+
+    unstackscreen();
+
+    menu_result  = mms_value;
+    menu_kbdchar = kbdchar;
+
+    atomic_store(&wasm_menu_active, 0);
+    atomic_store(&menu_done, 1);
+    return NULL;
+}
+
 #endif /* WASM_BUILD */
 
 /* ------------------------------------------------------------------ */
@@ -739,7 +864,8 @@ typedef enum {
     WS_COLOR_CYCLE,
     WS_PAN_CALC,      /* calculating only the newly exposed strip after a pan */
     WS_PAR_PRODUCE,   /* parallel SIMD path: push pixel rows into queue */
-    WS_PAR_WAIT       /* parallel SIMD path: wait for workers to finish */
+    WS_PAR_WAIT,      /* parallel SIMD path: wait for workers to finish */
+    WS_MENU           /* dedicated pthread running curses menu */
 } WasmState;
 
 static WasmState wasm_state = WS_INIT_VIDEO;
@@ -787,6 +913,11 @@ extern long maxit;
 /* Coordinate corners (defined in common/calcfrac.c / framain2.c) */
 extern double xxmin, xxmax, yymin, yymax, xx3rd, yy3rd;
 extern double sxmin, sxmax, symin, symax;
+
+/* Fractal parameters: param[0]=Julia real, param[1]=Julia imag, etc. */
+extern double param[];
+/* Escape radius (bailout is a long in this version of Fractint) */
+extern long   bailout;
 
 
 /*
@@ -967,7 +1098,7 @@ static void wasm_main_loop_callback(void)
         showfile    = 1;
         calcfracinit();
 
-        /* Restore URL-supplied coordinates after calcfracinit() resets them */
+        /* Restore JS-supplied values after calcfracinit() resets them */
         if (pending_coords) {
             xxmin = pending_xxmin;  xxmax = pending_xxmax;
             yymin = pending_yymin;  yymax = pending_yymax;
@@ -975,6 +1106,14 @@ static void wasm_main_loop_callback(void)
             sxmin = xxmin;          sxmax = xxmax;
             symin = yymin;          symax = yymax;
             pending_coords = 0;
+        }
+        if (pending_maxit) {
+            maxit = pending_maxit_val;
+            pending_maxit = 0;
+        }
+        if (pending_inside) {
+            inside = pending_inside_val;
+            pending_inside = 0;
         }
 
         wasm_state = WS_CALCFRAC;
@@ -1179,22 +1318,69 @@ static void wasm_main_loop_callback(void)
 
             par_current_row++;
             if (par_current_row >= ydots) {
-                /* All rows pushed — signal workers that production is done */
-                pworkers_finish();
-                writevideopalette();
-                calc_status = 4; /* mark as complete */
-                wasm_state = WS_DONE;
+                /* All rows pushed — signal workers that production is done.
+                 * Do NOT join here; that would block the browser main thread
+                 * until all workers finish.  Transition to WS_PAR_WAIT which
+                 * polls workers_running each frame and joins only when all
+                 * threads have already exited (instant join). */
+                pworkers_signal_done();
+                wasm_state = WS_PAR_WAIT;
             }
             par_produce_done:;
         }
         break;
 
     case WS_PAR_WAIT:
-        /* Fallthrough: pworkers_finish() is called inline at end of
-         * WS_PAR_PRODUCE, so WS_PAR_WAIT is not used in the current
-         * implementation.  Kept as a named state for future use. */
-        wasm_state = WS_DONE;
+        /*
+         * Non-blocking poll: check whether all worker threads have exited.
+         * workers_running is decremented inside pworker_func() (under lock)
+         * just before each thread returns.  When it reaches 0, all threads
+         * have already exited so pthread_join() returns immediately.
+         *
+         * This keeps the browser main thread free every frame — on slow
+         * hardware or high maxit the user never sees a frozen tab during
+         * the last batch of computation.
+         */
+        if (pqueue.workers_running == 0) {
+            int i;
+            for (i = 0; i < PQUEUE_THREADS; i++) {
+                pthread_join(pworkers[i], NULL); /* instant: already exited */
+            }
+            frame_dirty = 1;
+            writevideopalette();
+            calc_status = 4;
+            wasm_state  = WS_DONE;
+        }
+        /* else: stay in WS_PAR_WAIT, check again next frame */
         break;
+
+    case WS_MENU:
+        /*
+         * Non-blocking poll: check whether the menu pthread has finished.
+         * menu_done is set atomically by menu_thread_func() before it returns.
+         * pthread_join() is instant once the thread has already exited.
+         */
+        if (atomic_load(&menu_done)) {
+            pthread_join(menu_thread_id, NULL);
+            /* Clear key state so no stale keys linger into next calc */
+            keybuffer  = 0;
+            key_head = key_tail = 0;
+            switch (menu_result) {
+            case IMAGESTART:
+            case RESTORESTART:
+            case RESTART:
+                restart_requested = 0;
+                calc_status = 0;
+                wasm_state  = WS_INIT_VIDEO;
+                break;
+            default:
+                wasm_state = WS_DONE;
+                break;
+            }
+        }
+        /* else: stay in WS_MENU, check again next frame */
+        break;
+
 #endif /* WASM_BUILD */
     }
 }
@@ -1209,9 +1395,41 @@ void wasm_start_main_loop(void)
 {
     adapter    = 0;
     wasm_state = WS_INIT_VIDEO;
+#ifdef WASM_BUILD
+    key_channel_init(&menu_chan);
+#endif
     /* simulate_infinite_loop=0: return to JS immediately */
     emscripten_set_main_loop(wasm_main_loop_callback, 0, 0);
 }
+
+#ifdef WASM_BUILD
+/*
+ * wasm_open_menu — JS calls this to spawn the menu pthread.
+ * Only valid from WS_DONE; ignored if menu is already active.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_open_menu(int key)
+{
+    if (atomic_load(&wasm_menu_active)) return;
+    if (wasm_state != WS_DONE) return;
+
+    /* Flush main key ring */
+    key_head = key_tail = 0;
+
+    /* Flush menu channel */
+    pthread_mutex_lock(&menu_chan.lock);
+    menu_chan.head = menu_chan.tail = 0;
+    pthread_mutex_unlock(&menu_chan.lock);
+
+    atomic_store(&menu_done, 0);
+    menu_thread_arg.trigger_key = key;
+
+    wasm_state = WS_MENU;
+    atomic_store(&wasm_menu_active, 1);
+
+    pthread_create(&menu_thread_id, NULL, menu_thread_func, &menu_thread_arg);
+}
+#endif /* WASM_BUILD */
 
 /*
  * wasm_toggle_cycle — JS calls this to start/stop color cycling.
@@ -1388,9 +1606,15 @@ void wasm_zoom_at_point(int px, int py, double factor)
 static void text_putchar(int row, int col, int ch, int attr)
 {
     if (row >= 0 && row < TEXT_ROWS && col >= 0 && col < TEXT_COLS) {
+#ifdef WASM_BUILD
+        /* Write to back-buffer; menu thread calls text_buf_flush() to publish */
+        text_buf_back[row * TEXT_COLS + col] =
+            (uint16_t)((ch & 0xFF) | ((attr & 0xFF) << 8));
+#else
         text_buf[row * TEXT_COLS + col] =
             (uint16_t)((ch & 0xFF) | ((attr & 0xFF) << 8));
         text_buf_dirty = 1;
+#endif
     }
 }
 
@@ -1414,10 +1638,16 @@ void noecho(void)  { }
 void clear(void)
 {
     int i;
+#ifdef WASM_BUILD
+    for (i = 0; i < TEXT_ROWS * TEXT_COLS; i++)
+        text_buf_back[i] = (uint16_t)(' ' | (TEXT_ATTR_DEFAULT << 8));
+    text_buf_flush();
+#else
     for (i = 0; i < TEXT_ROWS * TEXT_COLS; i++)
         text_buf[i] = (uint16_t)(' ' | (TEXT_ATTR_DEFAULT << 8));
-    if (curwin) { curwin->_cur_y = 0; curwin->_cur_x = 0; }
     text_buf_dirty   = 1;
+#endif
+    if (curwin) { curwin->_cur_y = 0; curwin->_cur_x = 0; }
     /* Called only from setvideomode() case 0 — mark text mode active */
     text_mode_active = 1;
 }
@@ -1471,7 +1701,11 @@ void wclear(WINDOW *win)
             text_putchar(r, c, ' ', attr & 0xFF);
     win->_cur_y = 0;
     win->_cur_x = 0;
+#ifdef WASM_BUILD
+    text_buf_flush();
+#else
     text_buf_dirty = 1;
+#endif
 }
 
 void wdeleteln(WINDOW *win)
@@ -1482,12 +1716,22 @@ void wdeleteln(WINDOW *win)
     row = win->_cur_y;
     if (row < 0 || row >= TEXT_ROWS - 1) return;
     attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
+#ifdef WASM_BUILD
+    memmove(&text_buf_back[row * TEXT_COLS],
+            &text_buf_back[(row + 1) * TEXT_COLS],
+            (size_t)(TEXT_ROWS - 1 - row) * TEXT_COLS * sizeof(uint16_t));
+#else
     memmove(&text_buf[row * TEXT_COLS],
             &text_buf[(row + 1) * TEXT_COLS],
             (size_t)(TEXT_ROWS - 1 - row) * TEXT_COLS * sizeof(uint16_t));
+#endif
     for (col = 0; col < TEXT_COLS; col++)
         text_putchar(TEXT_ROWS - 1, col, ' ', attr & 0xFF);
+#ifdef WASM_BUILD
+    text_buf_flush();
+#else
     text_buf_dirty = 1;
+#endif
 }
 
 void winsertln(WINDOW *win)
@@ -1499,16 +1743,42 @@ void winsertln(WINDOW *win)
     if (row < 0 || row >= TEXT_ROWS) return;
     attr = win->_cur_attr ? win->_cur_attr : TEXT_ATTR_DEFAULT;
     if (row < TEXT_ROWS - 1)
+#ifdef WASM_BUILD
+        memmove(&text_buf_back[(row + 1) * TEXT_COLS],
+                &text_buf_back[row * TEXT_COLS],
+                (size_t)(TEXT_ROWS - 1 - row) * TEXT_COLS * sizeof(uint16_t));
+#else
         memmove(&text_buf[(row + 1) * TEXT_COLS],
                 &text_buf[row * TEXT_COLS],
                 (size_t)(TEXT_ROWS - 1 - row) * TEXT_COLS * sizeof(uint16_t));
+#endif
     for (col = 0; col < TEXT_COLS; col++)
         text_putchar(row, col, ' ', attr & 0xFF);
+#ifdef WASM_BUILD
+    text_buf_flush();
+#else
     text_buf_dirty = 1;
+#endif
 }
 
-void wrefresh(WINDOW *win)                 { (void)win; text_buf_dirty = 1; }
-void xrefresh(WINDOW *win, int l1, int l2) { (void)win; (void)l1; (void)l2; text_buf_dirty = 1; }
+void wrefresh(WINDOW *win)
+{
+    (void)win;
+#ifdef WASM_BUILD
+    text_buf_flush();
+#else
+    text_buf_dirty = 1;
+#endif
+}
+void xrefresh(WINDOW *win, int l1, int l2)
+{
+    (void)win; (void)l1; (void)l2;
+#ifdef WASM_BUILD
+    text_buf_flush();
+#else
+    text_buf_dirty = 1;
+#endif
+}
 void touchwin(WINDOW *win)                 { (void)win; }
 void wtouchln(WINDOW *win, int y, int n, int changed) { (void)win; (void)y; (void)n; (void)changed; }
 
@@ -1538,7 +1808,15 @@ void mvcur(int or, int oc, int nr, int nc)
     (void)or; (void)oc; (void)nr; (void)nc;
 }
 
-void refresh(int line1, int line2)         { (void)line1; (void)line2; text_buf_dirty = 1; }
+void refresh(int line1, int line2)
+{
+    (void)line1; (void)line2;
+#ifdef WASM_BUILD
+    text_buf_flush();
+#else
+    text_buf_dirty = 1;
+#endif
+}
 void xpopup(char *str)                     { (void)str; }
 void set_margins(int width, int height)    { (void)width; (void)height; }
 
@@ -1578,6 +1856,21 @@ uint16_t *wasm_get_text_buf(void)
 {
     return text_buf;
 }
+
+#ifdef WASM_BUILD
+/*
+ * wasm_get_text_gen — pointer to text_buf_gen atomic counter.
+ * JS reads this via HEAP32 with Atomics.load to detect torn reads:
+ *   odd  value = write in progress (skip frame)
+ *   even value = stable snapshot
+ */
+EMSCRIPTEN_KEEPALIVE
+int *wasm_get_text_gen(void)
+{
+    /* _Atomic int and int share the same layout; safe cast for JS HEAP32 */
+    return (int *)&text_buf_gen;
+}
+#endif /* WASM_BUILD */
 
 EMSCRIPTEN_KEEPALIVE
 int wasm_is_text_mode(void)
@@ -1645,6 +1938,166 @@ EMSCRIPTEN_KEEPALIVE
 int wasm_get_maxit(void)
 {
     return (int)maxit;
+}
+
+/*
+ * wasm_get_julia_re / wasm_get_julia_im — return the current Julia seed
+ * (param[0] real and param[1] imaginary).  Used by urlshare.js to include
+ * the seed in the URL hash so shared Julia fractal URLs are fully reproducible.
+ */
+EMSCRIPTEN_KEEPALIVE
+double wasm_get_julia_re(void) { return param[0]; }
+
+EMSCRIPTEN_KEEPALIVE
+double wasm_get_julia_im(void) { return param[1]; }
+
+/*
+ * wasm_set_palette_preset — apply a built-in 256-colour palette.
+ *
+ * Presets (all values are 6-bit VGA, 0-63):
+ *   0 = Default (colourful cycling rainbow — the initUnixWindow default)
+ *   1 = Fire    (black → deep red → orange → yellow → white)
+ *   2 = Ice     (black → dark blue → cyan → white)
+ *   3 = Greens  (black → dark green → bright green → pale yellow)
+ *   4 = Sunset  (black → purple → red → orange → yellow)
+ *   5 = Classic (Fractint traditional blue-cyan-white gradient)
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_palette_preset(int preset)
+{
+    int i;
+    switch (preset) {
+    case 0: /* Default — same formula as initUnixWindow() */
+        for (i = 0; i < 256; i++) {
+            dacbox[i][0] = (unsigned char)((i >> 5) * 8 + 7);
+            dacbox[i][1] = (unsigned char)((((i + 16) & 28) >> 2) * 8 + 7);
+            dacbox[i][2] = (unsigned char)(((i + 2) & 3) * 16 + 15);
+        }
+        dacbox[0][0] = dacbox[0][1] = dacbox[0][2] = 0;
+        dacbox[1][0] = dacbox[1][1] = dacbox[1][2] = 63;
+        break;
+
+    case 1: /* Fire */
+        dacbox[0][0] = dacbox[0][1] = dacbox[0][2] = 0;
+        for (i = 1; i < 256; i++) {
+            double t = (double)i / 255.0;
+            /* R: 0→63 early, G: 0→63 mid, B: stays near 0 */
+            dacbox[i][0] = (unsigned char)(t < 0.5 ? t * 2.0 * 63 : 63);
+            dacbox[i][1] = (unsigned char)(t < 0.5 ? 0 : (t - 0.5) * 2.0 * 63);
+            dacbox[i][2] = (unsigned char)(t > 0.85 ? (t - 0.85) / 0.15 * 40 : 0);
+        }
+        break;
+
+    case 2: /* Ice */
+        dacbox[0][0] = dacbox[0][1] = dacbox[0][2] = 0;
+        for (i = 1; i < 256; i++) {
+            double t = (double)i / 255.0;
+            dacbox[i][0] = (unsigned char)(t > 0.7 ? (t - 0.7) / 0.3 * 63 : 0);
+            dacbox[i][1] = (unsigned char)(t < 0.5 ? t * 2.0 * 40 : 40 + (t - 0.5) * 2.0 * 23);
+            dacbox[i][2] = (unsigned char)(t < 0.5 ? t * 2.0 * 63 : 63);
+        }
+        break;
+
+    case 3: /* Greens */
+        dacbox[0][0] = dacbox[0][1] = dacbox[0][2] = 0;
+        for (i = 1; i < 256; i++) {
+            double t = (double)i / 255.0;
+            dacbox[i][0] = (unsigned char)(t > 0.8 ? (t - 0.8) / 0.2 * 40 : 0);
+            dacbox[i][1] = (unsigned char)(t * 63);
+            dacbox[i][2] = (unsigned char)(t > 0.8 ? (t - 0.8) / 0.2 * 30 : 0);
+        }
+        break;
+
+    case 4: /* Sunset */
+        dacbox[0][0] = dacbox[0][1] = dacbox[0][2] = 0;
+        for (i = 1; i < 256; i++) {
+            double t = (double)i / 255.0;
+            /* purple → red → orange → yellow */
+            dacbox[i][0] = (unsigned char)(t < 0.3 ? t / 0.3 * 40 : 40 + (t - 0.3) / 0.7 * 23);
+            dacbox[i][1] = (unsigned char)(t < 0.5 ? 0 : (t - 0.5) / 0.5 * 55);
+            dacbox[i][2] = (unsigned char)(t < 0.3 ? t / 0.3 * 30 : t < 0.5 ? (0.5 - t) / 0.2 * 30 : 0);
+        }
+        break;
+
+    default: /* Classic Fractint blue-cyan-white */
+    case 5:
+        dacbox[0][0] = dacbox[0][1] = dacbox[0][2] = 0;
+        for (i = 1; i < 256; i++) {
+            double t = (double)i / 255.0;
+            dacbox[i][0] = (unsigned char)(t > 0.66 ? (t - 0.66) / 0.34 * 63 : 0);
+            dacbox[i][1] = (unsigned char)(t > 0.33 ? (t - 0.33) / 0.67 * 63 : 0);
+            dacbox[i][2] = (unsigned char)(t * 63);
+        }
+        break;
+    }
+    writevideopalette();
+    /* palette_dirty is set by writevideopalette(); frame will re-blit */
+}
+
+/*
+ * wasm_set_maxit — change the maximum iteration count.
+ * calcfracinit() resets maxit to the fractal's default, so we use the
+ * pending pattern to apply the value after calcfracinit() runs.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_maxit(int n)
+{
+    if (n < 2)     n = 2;
+    if (n > 32767) n = 32767;
+    pending_maxit_val = (long)n;
+    pending_maxit     = 1;
+    restart_requested = 1;
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
+}
+
+/*
+ * wasm_set_inside — change the inside coloring mode.
+ * Common values: 0=black, 1=blue (default), -1=ZMAG, -2=BOFS.
+ * calcfracinit() may reset inside, so use the pending pattern.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_inside(int mode)
+{
+    pending_inside_val = mode;
+    pending_inside     = 1;
+    restart_requested  = 1;
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_get_inside(void) { return inside; }
+
+/*
+ * wasm_set_outside — change the outside (escaped) coloring mode.
+ * Common values: 0=ITER (default), 2=REAL, 3=IMAG, 4=MULT, 5=SUM, 6=ATAN.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_outside(int mode)
+{
+    outside = mode;
+    restart_requested = 1;
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_get_outside(void) { return outside; }
+
+/*
+ * wasm_set_julia_params — set Julia set seed (C parameter).
+ * param[0] = real part, param[1] = imaginary part.
+ * Works for JULIAFP (6), JULIA (1), and other Julia-type fractals.
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_julia_params(double cre, double cim)
+{
+    param[0] = cre;
+    param[1] = cim;
+    restart_requested = 1;
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
 }
 
 /*

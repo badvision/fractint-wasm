@@ -19,6 +19,17 @@
     </div>
     <div id="controls-panel">
       <div class="control-group">
+        <h3>Palette</h3>
+        <select id="palette-preset" title="Select colour palette">
+          <option value="0" selected>Default (Rainbow)</option>
+          <option value="5">Classic (Blue→White)</option>
+          <option value="1">Fire</option>
+          <option value="2">Ice</option>
+          <option value="3">Greens</option>
+          <option value="4">Sunset</option>
+        </select>
+      </div>
+      <div class="control-group">
         <h3>Color Cycling</h3>
         <button id="cycle-toggle">&#9654; Cycle</button>
         <label>Speed <input type="range" id="cycle-speed" min="1" max="10" value="7"></label>
@@ -27,20 +38,93 @@
       <div class="control-group" id="fractal-type-group">
         <h3>Fractal Type</h3>
         <select id="fractal-type" title="Select fractal type">
-          <option value="4" selected>Mandelbrot (FP)</option>
-          <option value="0">Mandelbrot (int)</option>
-          <option value="6">Julia (FP)</option>
-          <option value="1">Julia (int)</option>
-          <option value="5">Newton</option>
-          <option value="2">Newton Basin</option>
-          <option value="68">Complex Newton</option>
-          <option value="74">Sierpinski (FP)</option>
-          <option value="12">Sierpinski (int)</option>
-          <option value="76">Barnsley M1 (FP)</option>
-          <option value="13">Barnsley M1 (int)</option>
-          <option value="63">Lorenz (FP)</option>
-          <option value="157">Marks Mandelbrot (FP)</option>
+          <optgroup label="── Mandelbrot Family ──">
+            <option value="4" selected>Mandelbrot (FP)</option>
+            <option value="0">Mandelbrot (int)</option>
+            <option value="9">Man O' War (FP)</option>
+            <option value="155">Mandelbrot Z⁴ (FP)</option>
+            <option value="96">Magnet Mandelbrot 1</option>
+            <option value="98">Magnet Mandelbrot 2</option>
+            <option value="157">Marks Mandelbrot (FP)</option>
+            <option value="148">Phoenix Mandelbrot</option>
+            <option value="150">Phoenix Mandelbrot (FP)</option>
+          </optgroup>
+          <optgroup label="── Julia Family ──">
+            <option value="6">Julia (FP)</option>
+            <option value="1">Julia (int)</option>
+            <option value="156">Julia Z⁴ (FP)</option>
+            <option value="97">Magnet Julia 1</option>
+            <option value="99">Magnet Julia 2</option>
+            <option value="108">Man O' War Julia (FP)</option>
+            <option value="109">Man O' War Julia (int)</option>
+          </optgroup>
+          <optgroup label="── Newton ──">
+            <option value="5">Newton</option>
+            <option value="2">Newton Basin</option>
+            <option value="68">Complex Newton</option>
+            <option value="69">Complex Newton Basin</option>
+            <option value="138">Halley</option>
+          </optgroup>
+          <optgroup label="── IFS / Classic ──">
+            <option value="74">Sierpinski (FP)</option>
+            <option value="12">Sierpinski (int)</option>
+            <option value="76">Barnsley M1 (FP)</option>
+            <option value="78">Barnsley M2 (FP)</option>
+            <option value="80">Barnsley M3 (FP)</option>
+            <option value="77">Barnsley J1 (FP)</option>
+            <option value="23">Unity</option>
+          </optgroup>
+          <optgroup label="── Attractors ──">
+            <option value="63">Lorenz (FP)</option>
+            <option value="86">Rossler (FP)</option>
+            <option value="88">Henon (FP)</option>
+            <option value="90">Gingerbread (FP)</option>
+            <option value="93">Spider (FP)</option>
+            <option value="61">Popcorn (FP)</option>
+          </optgroup>
+          <optgroup label="── Other ──">
+            <option value="7">Plasma</option>
+            <option value="95">Tetration (FP)</option>
+            <option value="32">Bifurcation</option>
+            <option value="91">Diffusion</option>
+            <option value="121">Circle (FP)</option>
+            <option value="139">Dynamic (FP)</option>
+          </optgroup>
         </select>
+      </div>
+      <div class="control-group" id="fractal-params-group">
+        <h3>Parameters</h3>
+        <label>Max Iterations
+          <input type="number" id="param-maxit" min="2" max="32767" value="150" step="50">
+        </label>
+        <label>Inside Color
+          <select id="param-inside">
+            <option value="1" selected>Blue (default)</option>
+            <option value="0">Black</option>
+            <option value="-1">ZMAG</option>
+            <option value="-2">BOFS</option>
+          </select>
+        </label>
+        <label>Outside Color
+          <select id="param-outside">
+            <option value="0" selected>ITER (default)</option>
+            <option value="2">REAL</option>
+            <option value="3">IMAG</option>
+            <option value="4">MULT</option>
+            <option value="5">SUM</option>
+            <option value="6">ATAN</option>
+          </select>
+        </label>
+      </div>
+      <div class="control-group" id="julia-params-group" style="display:none">
+        <h3>Julia Seed (C)</h3>
+        <label>Real
+          <input type="number" id="param-julia-re" value="-0.7" step="0.01">
+        </label>
+        <label>Imag
+          <input type="number" id="param-julia-im" value="0.27015" step="0.01">
+        </label>
+        <button id="btn-apply-julia">Apply</button>
       </div>
       <div class="control-group">
         <h3>View</h3>
@@ -49,6 +133,11 @@
         <button id="btn-zoom-out">- Zoom Out</button>
         <button id="btn-save">Save Image</button>
         <button id="btn-share">Share URL</button>
+      </div>
+      <div class="control-group" id="qr-group">
+        <h3>Share QR</h3>
+        <div id="qr-canvas"></div>
+        <small class="qr-hint">Scan to open this fractal</small>
       </div>
       <div class="help-hint">
         <small>Click = zoom in · Right-click = zoom out<br>
@@ -75,6 +164,8 @@ Scroll = zoom · +/C = color cycle · Home = reset</small>
   <script src="js/textoverlay.js"></script>
   <script src="js/urlshare.js"></script>
   <script src="js/fractint-wasm.js"></script>
+  <script src="js/qrcode.min.js"></script>
+  <script src="js/qrwidget.js"></script>
   <script src="fractint.js"></script>
 </body>
 </html>

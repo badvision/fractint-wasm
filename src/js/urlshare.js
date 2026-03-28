@@ -6,13 +6,17 @@
  * bookmarked and shared.
  *
  * Hash format: #<base64(JSON)>
- * JSON keys: { t, x0, x1, y0, y1, i }
- *   t  — fractal type index
- *   x0 — xxmin
- *   x1 — xxmax
- *   y0 — yymin
- *   y1 — yymax
- *   i  — maxit (max iterations)
+ * JSON keys: { t, x0, x1, y0, y1, i, in, out [, p0, p1] }
+ *   t   — fractal type index
+ *   x0  — xxmin
+ *   x1  — xxmax
+ *   y0  — yymin
+ *   y1  — yymax
+ *   i   — maxit (max iterations)
+ *   in  — inside coloring mode
+ *   out — outside coloring mode
+ *   p0  — Julia seed real part (Julia-family fractals only)
+ *   p1  — Julia seed imaginary part (Julia-family fractals only)
  */
 
 (function () {
@@ -26,21 +30,37 @@
   var fnGetMaxit   = null;
   var fnGetFractype = null;
   var fnSetFractype = null;
+  var fnSetMaxit    = null;
   var fnResize      = null;
+  var fnGetInside  = null;
+  var fnGetOutside = null;
+  var fnSetInside  = null;
+  var fnSetOutside = null;
+  var fnGetJuliaRe = null;
+  var fnGetJuliaIm = null;
 
   /* ---------------------------------------------------------------- */
   /* Encode current state to URL hash                                 */
   /* ---------------------------------------------------------------- */
 
   function currentParams() {
-    return {
-      t:  fnGetFractype(),
-      x0: fnGetXxmin(),
-      x1: fnGetXxmax(),
-      y0: fnGetYymin(),
-      y1: fnGetYymax(),
-      i:  fnGetMaxit()
+    var p = {
+      t:   fnGetFractype(),
+      x0:  fnGetXxmin(),
+      x1:  fnGetXxmax(),
+      y0:  fnGetYymin(),
+      y1:  fnGetYymax(),
+      i:   fnGetMaxit(),
+      in:  fnGetInside(),
+      out: fnGetOutside()
     };
+    /* Only serialize Julia seed for Julia-family fractals */
+    var JULIA_TYPES = { 1: true, 6: true, 108: true, 109: true };
+    if (JULIA_TYPES[p.t] && fnGetJuliaRe) {
+      p.p0 = fnGetJuliaRe();
+      p.p1 = fnGetJuliaIm();
+    }
+    return p;
   }
 
   /* Replace the current history entry with the present fractal state.
@@ -52,6 +72,7 @@
       var params = currentParams();
       var hash = btoa(JSON.stringify(params));
       history.replaceState(params, '', '#' + hash);
+      window.dispatchEvent(new CustomEvent('fractinthashchange'));
     } catch (e) {
       console.warn('[URLShare] encode error:', e);
     }
@@ -66,6 +87,7 @@
       var params = currentParams();
       var hash = btoa(JSON.stringify(params));
       history.pushState(params, '', '#' + hash);
+      window.dispatchEvent(new CustomEvent('fractinthashchange'));
     } catch (e) {
       console.warn('[URLShare] pushState error:', e);
     }
@@ -90,12 +112,27 @@
       if (typeof params.t === 'number' && fnSetFractype) {
         fnSetFractype(params.t);
       }
+      if (typeof params.i === 'number' && fnSetMaxit) {
+        fnSetMaxit(params.i);
+      }
+      if (typeof params.in === 'number' && fnSetInside) {
+        fnSetInside(params.in);
+      }
+      if (typeof params.out === 'number' && fnSetOutside) {
+        fnSetOutside(params.out);
+      }
+      if (typeof params.p0 === 'number' && typeof params.p1 === 'number') {
+        Module.ccall('wasm_set_julia_params', 'void',
+                     ['number', 'number'],
+                     [params.p0, params.p1]);
+      }
 
       /* Set coordinate corners — wasm_set_coords accepts 4 doubles */
       Module.ccall('wasm_set_coords', 'void',
                    ['number','number','number','number'],
                    [params.x0, params.x1, params.y0, params.y1]);
 
+      window.dispatchEvent(new CustomEvent('fractinstaterestored', { detail: params }));
       return true;
     } catch (e) {
       /* Silently ignore invalid or missing hash */
@@ -139,9 +176,24 @@
         if (typeof params.t === 'number' && fnSetFractype) {
           fnSetFractype(params.t);
         }
+        if (typeof params.i === 'number' && fnSetMaxit) {
+          fnSetMaxit(params.i);
+        }
+        if (typeof params.in === 'number' && fnSetInside) {
+          fnSetInside(params.in);
+        }
+        if (typeof params.out === 'number' && fnSetOutside) {
+          fnSetOutside(params.out);
+        }
+        if (typeof params.p0 === 'number' && typeof params.p1 === 'number') {
+          Module.ccall('wasm_set_julia_params', 'void',
+                       ['number', 'number'],
+                       [params.p0, params.p1]);
+        }
         Module.ccall('wasm_set_coords', 'void',
                      ['number','number','number','number'],
                      [params.x0, params.x1, params.y0, params.y1]);
+        window.dispatchEvent(new CustomEvent('fractinstaterestored', { detail: params }));
       } catch (err) {
         console.warn('[URLShare] popstate restore error:', err);
       }
@@ -164,6 +216,13 @@
       fnGetMaxit    = Module.cwrap('wasm_get_maxit',   'number', []);
       fnGetFractype = Module.cwrap('wasm_get_fractype','number', []);
       fnSetFractype = Module.cwrap('wasm_set_fractype','void',   ['number']);
+      fnSetMaxit    = Module.cwrap('wasm_set_maxit',   'void',   ['number']);
+      fnGetInside  = Module.cwrap('wasm_get_inside',  'number', []);
+      fnGetOutside = Module.cwrap('wasm_get_outside', 'number', []);
+      fnSetInside  = Module.cwrap('wasm_set_inside',  'void',   ['number']);
+      fnSetOutside = Module.cwrap('wasm_set_outside', 'void',   ['number']);
+      fnGetJuliaRe = Module.cwrap('wasm_get_julia_re', 'number', []);
+      fnGetJuliaIm = Module.cwrap('wasm_get_julia_im', 'number', []);
     } catch (e) {
       console.warn('[URLShare] WASM exports not available:', e);
       return;

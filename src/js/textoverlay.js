@@ -51,6 +51,10 @@
   var fnGetTextBuf        = null;
   var fnIsTextMode        = null;
   var fnConsumeTextDirty  = null;
+  var fnGetTextGen        = null;
+
+  /* Pointer to text_buf_gen atomic counter in WASM heap (byte offset) */
+  var genPtr = null;
 
   function initTextOverlay() {
     textCanvas = document.createElement('canvas');
@@ -87,6 +91,10 @@
       fnGetTextBuf       = Module.cwrap('wasm_get_text_buf',       'number', []);
       fnIsTextMode       = Module.cwrap('wasm_is_text_mode',       'number', []);
       fnConsumeTextDirty = Module.cwrap('wasm_consume_text_dirty', 'number', []);
+      fnGetTextGen       = Module.cwrap('wasm_get_text_gen',       'number', []);
+      if (fnGetTextGen) {
+        genPtr = fnGetTextGen();
+      }
     } catch (e) {
       console.warn('[TextOverlay] WASM exports not available:', e);
     }
@@ -94,6 +102,16 @@
 
   function renderTextBuf() {
     if (!textCtx || !fnGetTextBuf || !Module.HEAPU16) return;
+
+    /* Generation guard: skip frame if a write is in progress or torn.
+     * text_buf_flush() increments gen to odd before memcpy, then to even after.
+     * We snapshot gen before reading and verify it hasn't changed after. */
+    var gen1 = 0;
+    var useGen = (genPtr !== null) && Module.HEAP32;
+    if (useGen) {
+      gen1 = Atomics.load(Module.HEAP32, genPtr >> 2);
+      if (gen1 & 1) return;  /* write in progress — odd generation, skip frame */
+    }
 
     var ptr = fnGetTextBuf();
     if (!ptr) return;
@@ -123,6 +141,13 @@
           textCtx.fillText(String.fromCharCode(ch), x, y);
         }
       }
+    }
+
+    /* Post-render torn-read check: if gen changed during render, the canvas
+     * may show partial data — skip commit and let next frame repaint cleanly. */
+    if (useGen) {
+      var gen2 = Atomics.load(Module.HEAP32, genPtr >> 2);
+      if (gen2 !== gen1) return;  /* torn — next frame will repaint */
     }
   }
 

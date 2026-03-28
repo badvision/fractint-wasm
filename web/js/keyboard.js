@@ -27,10 +27,28 @@
   var keyQueue = [];
   var moduleReady = false;
 
+  /* Keys that open Fractint curses menus via Path A (wasm_open_menu pthread) */
+  var MENU_KEYS = {
+    120: 1,   /* 'x' basic options     */
+    122: 1,   /* 'z' fractal params    */
+    116: 1,   /* 't' fractal type      */
+    121: 1,   /* 'y' extended params   */
+    32:  1    /* SPACE mandel/julia toggle */
+  };
+
+  function dispatchKey(code) {
+    if (!window.Module || !window.Module.ccall) return;
+    if (MENU_KEYS[code] && window.Module._wasm_open_menu) {
+      window.Module.ccall('wasm_open_menu', null, ['number'], [code]);
+    } else {
+      window.Module.ccall('wasm_push_key', null, ['number'], [code]);
+    }
+  }
+
   function pushKey(code) {
     if (code === 0) return;
     if (moduleReady && window.Module && window.Module.ccall) {
-      window.Module.ccall('wasm_push_key', null, ['number'], [code]);
+      dispatchKey(code);
     } else {
       keyQueue.push(code);
     }
@@ -40,9 +58,7 @@
     moduleReady = true;
     while (keyQueue.length > 0) {
       var code = keyQueue.shift();
-      if (window.Module && window.Module.ccall) {
-        window.Module.ccall('wasm_push_key', null, ['number'], [code]);
-      }
+      dispatchKey(code);
     }
   }
 
