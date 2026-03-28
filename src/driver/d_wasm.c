@@ -823,7 +823,13 @@ static void *menu_thread_func(void *arg)
     int kbdchar    = marg->trigger_key;
     int mms_value  = CONTINUE;
 
-    stackscreen();
+    /* Enter text mode directly — avoids stackscreen()'s curses window
+     * allocation machinery (farmemalloc/newwin) which is unsafe from a
+     * pthread context. LINES/COLS may be 0 on this thread, and newwin()
+     * with zero dimensions triggers an unreachable trap in the WASM build. */
+    text_mode_active = 1;
+    memset(text_buf_back, ' ', sizeof(text_buf_back));
+    text_buf_flush();
 
     do {
         mms_value = main_menu_switch(&kbdchar, &frommandel,
@@ -833,7 +839,9 @@ static void *menu_thread_func(void *arg)
         }
     } while (mms_value == CONTINUE && kbdmore);
 
-    unstackscreen();
+    /* Exit text mode directly */
+    text_mode_active = 0;
+    text_buf_dirty   = 1;
 
     menu_result  = mms_value;
     menu_kbdchar = kbdchar;

@@ -1,14 +1,55 @@
 const { test, expect } = require('@playwright/test');
 
+/**
+ * Set up error capture on a page BEFORE navigation.
+ *
+ * Returns an `errors` array that accumulates:
+ *   - pageerror events (main-thread JS errors)
+ *   - console.error messages (includes Worker-propagated errors via
+ *     fractint-wasm.js's worker.onerror → Module.printErr path)
+ *
+ * Also injects an initScript that patches console.error so messages
+ * containing 'unreachable' or 'worker sent an error' are stored in
+ * window.__workerErrors, giving tests a second surface to check.
+ *
+ * NOTE: call this BEFORE page.goto() so all listeners are registered
+ * before any network activity begins.
+ */
+async function setupErrorCapture(page) {
+  const errors = [];
+
+  // Main-thread JS errors
+  page.on('pageerror', err => errors.push('pageerror: ' + err.message));
+
+  // console.error — Worker crashes propagate here via worker.onerror in
+  // fractint-wasm.js which calls Module.printErr on the main thread.
+  page.on('console', msg => {
+    if (msg.type() === 'error') errors.push('console.error: ' + msg.text());
+  });
+
+  // Patch console.error in the page context so Worker-crash keywords are
+  // stored separately; useful for targeted assertions.
+  await page.addInitScript(() => {
+    const origError = console.error.bind(console);
+    console.error = (...args) => {
+      origError(...args);
+      const msg = args.join(' ');
+      if (msg.includes('unreachable') || msg.includes('worker sent an error') ||
+          msg.includes('RuntimeError')) {
+        window.__workerErrors = window.__workerErrors || [];
+        window.__workerErrors.push(msg);
+      }
+    };
+  });
+
+  return errors;
+}
+
 test.describe('Fractint WASM smoke tests', () => {
 
   test.beforeEach(async ({ page }) => {
-    // Capture console errors
-    const errors = [];
-    page.on('console', msg => {
-      if (msg.type() === 'error') errors.push(msg.text());
-    });
-    page.on('pageerror', err => errors.push(err.message));
+    // Register listeners BEFORE goto so nothing is missed
+    const errors = await setupErrorCapture(page);
 
     await page.goto('/');
 
@@ -32,13 +73,10 @@ test.describe('Fractint WASM smoke tests', () => {
   });
 
   test('fractal type dropdown changes fractal', async ({ page }) => {
-    const errors = [];
-    page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
-
     await page.selectOption('#fractal-type', '1');  // Julia
     // Wait a moment for render to start
     await page.waitForTimeout(500);
-    expect(errors).toHaveLength(0);
+    expect(page._testErrors).toHaveLength(0);
   });
 
   test('arrow keys pan the fractal', async ({ page }) => {
@@ -51,10 +89,6 @@ test.describe('Fractint WASM smoke tests', () => {
   });
 
   test('zoom via rectangle drag does not crash', async ({ page }) => {
-    const errors = [];
-    page.on('pageerror', err => errors.push(err.message));
-    page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
-
     const canvas = page.locator('#canvas');
     const box = await canvas.boundingBox();
 
@@ -67,13 +101,10 @@ test.describe('Fractint WASM smoke tests', () => {
     // Wait for render
     await page.waitForTimeout(2000);
 
-    expect(errors).toHaveLength(0);
+    expect(page._testErrors).toHaveLength(0);
   });
 
   test('arrow keys work after zoom', async ({ page }) => {
-    const errors = [];
-    page.on('pageerror', err => errors.push(err.message));
-
     const canvas = page.locator('#canvas');
     const box = await canvas.boundingBox();
 
@@ -89,27 +120,27 @@ test.describe('Fractint WASM smoke tests', () => {
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(500);
 
-    expect(errors).toHaveLength(0);
+    expect(page._testErrors).toHaveLength(0);
   });
 
-  test('Z key does not crash', async ({ page }) => {
-    const errors = [];
-    page.on('pageerror', err => errors.push(err.message));
-    page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
-
+  test('Z key does not crash worker', async ({ page }) => {
     const canvas = page.locator('#canvas');
     await canvas.click();
     await page.keyboard.press('z');
+    // Give the menu pthread time to start, run, and potentially crash
     await page.waitForTimeout(2000);
 
-    expect(errors).toHaveLength(0);
+    // Check both error surfaces
+    const workerErrors = await page.evaluate(() => window.__workerErrors || []);
+    expect(workerErrors, 'Worker errors: ' + JSON.stringify(workerErrors)).toHaveLength(0);
+
+    const unrecoverableErrors = page._testErrors.filter(
+      e => e.includes('unreachable') || e.includes('RuntimeError')
+    );
+    expect(unrecoverableErrors, 'Crash errors: ' + JSON.stringify(unrecoverableErrors)).toHaveLength(0);
   });
 
   test('Z key after zoom rectangle does not crash or freeze', async ({ page }) => {
-    const errors = [];
-    page.on('pageerror', err => errors.push(err.message));
-    page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
-
     const canvas = page.locator('#canvas');
     const box = await canvas.boundingBox();
 
@@ -129,13 +160,16 @@ test.describe('Fractint WASM smoke tests', () => {
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(500);
 
-    expect(errors.filter(e => e.includes('unreachable') || e.includes('RuntimeError'))).toHaveLength(0);
+    const workerErrors = await page.evaluate(() => window.__workerErrors || []);
+    expect(workerErrors, 'Worker errors: ' + JSON.stringify(workerErrors)).toHaveLength(0);
+
+    const crashErrors = page._testErrors.filter(
+      e => e.includes('unreachable') || e.includes('RuntimeError')
+    );
+    expect(crashErrors, 'Crash errors: ' + JSON.stringify(crashErrors)).toHaveLength(0);
   });
 
   test('arrow keys work before and after fractal type change', async ({ page }) => {
-    const errors = [];
-    page.on('pageerror', err => errors.push(err.message));
-
     const canvas = page.locator('#canvas');
     await canvas.click();
     await page.keyboard.press('ArrowRight');
@@ -148,7 +182,7 @@ test.describe('Fractint WASM smoke tests', () => {
     await page.keyboard.press('ArrowLeft');
     await page.waitForTimeout(300);
 
-    expect(errors).toHaveLength(0);
+    expect(page._testErrors).toHaveLength(0);
   });
 
 });
