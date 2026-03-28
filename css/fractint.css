@@ -194,6 +194,50 @@ input[type="range"] {
   accent-color: #7cf;
 }
 
+input[type="number"] {
+  width: 100%;
+  padding: 5px 6px;
+  background: #222;
+  color: #ccc;
+  border: 1px solid #444;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+input[type="number"]:focus {
+  border-color: #0af;
+  outline: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* QR code widget                                                      */
+/* ------------------------------------------------------------------ */
+
+#qr-canvas {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 80px;
+}
+
+/* qrcodejs renders a table or canvas; centre and round it */
+#qr-canvas canvas,
+#qr-canvas img {
+  display: block;
+  margin: 0 auto;
+  border-radius: 4px;
+  border: 3px solid #2a2a2a;
+}
+
+.qr-hint {
+  display: block;
+  text-align: center;
+  color: #555;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
 .help-hint {
   margin-top: auto;
   padding: 8px;
