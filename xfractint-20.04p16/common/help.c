@@ -1052,6 +1052,9 @@ int read_help_topic(int label_num, int off, int len, VOIDFARPTR buf)
     */
    {
    int ret;
+   /* Guard: help system not initialised (no .hlp file) */
+   if (label == NULL || help_file == -1)
+      return -len;
    ret = _read_help_topic(label[label_num].topic_num,
                           label[label_num].topic_off + off, len, buf);
    return ( ret );

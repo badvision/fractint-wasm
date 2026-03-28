@@ -936,7 +936,9 @@ void stackscreen()
          exit(1);
          }
       if ((ptr = (savescreen[i] = (BYTE far *)farmemalloc(sizeof(int *)))))
+      {
          savecurses((WINDOW **)ptr);
+      }
       else {
          stopmsg(1,msg);
          exit(1);
@@ -944,7 +946,9 @@ void stackscreen()
       setclear();
       }
    else
+   {
       setfortext();
+   }
 }
 
 void unstackscreen()

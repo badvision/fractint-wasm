@@ -125,9 +125,19 @@ test.describe('Fractint WASM smoke tests', () => {
 
   test('Z key does not crash worker', async ({ page }) => {
     const canvas = page.locator('#canvas');
+
+    // Poll until the fractal engine is in WS_DONE state before pressing Z.
+    // The beforeEach only waits for loading-overlay to hide (WASM ready),
+    // but the engine may still be in WS_CALCFRAC.
+    await page.waitForFunction(() => {
+      if (!window.Module || !window.Module.ccall) return false;
+      const d1 = window.Module.ccall('wasm_consume_dirty', 'number', [], []);
+      return d1 === 0;
+    }, { timeout: 15000, polling: 200 });
+
     await canvas.click();
     await page.keyboard.press('z');
-    // Give the menu pthread time to start, run, and potentially crash
+    // Give the menu pthread time to start and run
     await page.waitForTimeout(2000);
 
     // Check both error surfaces
