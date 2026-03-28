@@ -550,6 +550,7 @@ typedef struct {
  * wasm_set_maxit() / wasm_set_inside() can't corrupt an in-progress frame. */
 typedef struct {
     long  maxit;
+    long  bailout;
     int   inside;
     int   colors;
     int   scr_w;
@@ -643,7 +644,7 @@ static void *pworker_func(void *arg)
             v128_t ci = wasm_f64x2_make(items[0].cy, items[1].cy);
             v128_t zr = wasm_f64x2_splat(0.0);
             v128_t zi = wasm_f64x2_splat(0.0);
-            v128_t bail = wasm_f64x2_splat(4.0);
+            v128_t bail = wasm_f64x2_splat((double)ctx->bailout);
             /* iteration counts as doubles for lane accumulation */
             v128_t iters  = wasm_f64x2_splat(0.0);
             v128_t one    = wasm_f64x2_splat(1.0);
@@ -695,7 +696,7 @@ static void *pworker_func(void *arg)
             for (; iter < limit; iter++) {
                 double r2 = pzr * pzr;
                 double i2 = pzi * pzi;
-                if (r2 + i2 > 4.0) break;
+                if (r2 + i2 > (double)ctx->bailout) break;
                 double nr = r2 - i2 + czr;
                 pzi = 2.0 * pzr * pzi + czi;
                 pzr = nr;
@@ -714,10 +715,11 @@ static void pworkers_start(void)
 {
     int i;
     /* Snapshot globals that workers must not read live */
-    pworker_ctx.maxit  = maxit;
-    pworker_ctx.inside = inside;
-    pworker_ctx.colors = colors;
-    pworker_ctx.scr_w  = screen_w;
+    pworker_ctx.maxit    = maxit;
+    pworker_ctx.bailout  = bailout;
+    pworker_ctx.inside   = inside;
+    pworker_ctx.colors   = colors;
+    pworker_ctx.scr_w    = screen_w;
     pqueue_init();
     pqueue.done            = 0;
     pqueue.abort           = 0;
@@ -2091,6 +2093,28 @@ void wasm_set_outside(int mode)
 
 EMSCRIPTEN_KEEPALIVE
 int wasm_get_outside(void) { return outside; }
+
+/*
+ * wasm_set_bailout — change the escape-radius squared (bailout value).
+ * calcfracinit() reads bailout directly (fracsubr.c line 291: rqlim = bailout
+ * when bailout != 0), so no pending pattern is needed — set it and restart.
+ * Minimum meaningful value is 2 (radius sqrt(2) ≈ 1.41 > 1).
+ */
+EMSCRIPTEN_KEEPALIVE
+void wasm_set_bailout(int val)
+{
+    if (val < 2) val = 2;      /* minimum meaningful bailout */
+    bailout = (long)val;
+    restart_requested = 1;     /* trigger recalculation */
+    calc_status = 0;
+    wasm_state  = WS_INIT_VIDEO;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int wasm_get_bailout(void)
+{
+    return (int)bailout;
+}
 
 /*
  * wasm_set_julia_params — set Julia set seed (C parameter).

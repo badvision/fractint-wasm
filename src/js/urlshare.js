@@ -36,6 +36,8 @@
   var fnGetOutside = null;
   var fnSetInside  = null;
   var fnSetOutside = null;
+  var fnGetBailout = null;
+  var fnSetBailout = null;
   var fnGetJuliaRe = null;
   var fnGetJuliaIm = null;
 
@@ -52,7 +54,8 @@
       y1:  fnGetYymax(),
       i:   fnGetMaxit(),
       in:  fnGetInside(),
-      out: fnGetOutside()
+      out: fnGetOutside(),
+      b:   fnGetBailout()
     };
     /* Only serialize Julia seed for Julia-family fractals */
     var JULIA_TYPES = { 1: true, 6: true, 108: true, 109: true };
@@ -121,6 +124,9 @@
       if (typeof params.out === 'number' && fnSetOutside) {
         fnSetOutside(params.out);
       }
+      if (typeof params.b === 'number' && fnSetBailout) {
+        fnSetBailout(params.b);
+      }
       if (typeof params.p0 === 'number' && typeof params.p1 === 'number') {
         Module.ccall('wasm_set_julia_params', 'void',
                      ['number', 'number'],
@@ -185,6 +191,9 @@
         if (typeof params.out === 'number' && fnSetOutside) {
           fnSetOutside(params.out);
         }
+        if (typeof params.b === 'number' && fnSetBailout) {
+          fnSetBailout(params.b);
+        }
         if (typeof params.p0 === 'number' && typeof params.p1 === 'number') {
           Module.ccall('wasm_set_julia_params', 'void',
                        ['number', 'number'],
@@ -221,6 +230,8 @@
       fnGetOutside = Module.cwrap('wasm_get_outside', 'number', []);
       fnSetInside  = Module.cwrap('wasm_set_inside',  'void',   ['number']);
       fnSetOutside = Module.cwrap('wasm_set_outside', 'void',   ['number']);
+      fnGetBailout = Module.cwrap('wasm_get_bailout', 'number', []);
+      fnSetBailout = Module.cwrap('wasm_set_bailout', 'void',   ['number']);
       fnGetJuliaRe = Module.cwrap('wasm_get_julia_re', 'number', []);
       fnGetJuliaIm = Module.cwrap('wasm_get_julia_im', 'number', []);
     } catch (e) {

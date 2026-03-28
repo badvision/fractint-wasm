@@ -21,6 +21,8 @@
   var wasmSetMaxit         = null;
   var wasmSetInside        = null;
   var wasmSetOutside       = null;
+  var wasmSetBailout       = null;
+  var wasmGetBailout       = null;
   var wasmSetJuliaParams   = null;
   var wasmSetPalettePreset = null;
 
@@ -82,6 +84,8 @@
       wasmSetMaxit         = Module.cwrap('wasm_set_maxit',          'void', ['number']);
       wasmSetInside        = Module.cwrap('wasm_set_inside',         'void', ['number']);
       wasmSetOutside       = Module.cwrap('wasm_set_outside',        'void', ['number']);
+      wasmSetBailout       = Module.cwrap('wasm_set_bailout',        'void', ['number']);
+      wasmGetBailout       = Module.cwrap('wasm_get_bailout',        'number', []);
       wasmSetJuliaParams   = Module.cwrap('wasm_set_julia_params',   'void', ['number','number']);
       wasmSetPalettePreset = Module.cwrap('wasm_set_palette_preset', 'void', ['number']);
     } catch (e) {
@@ -109,6 +113,7 @@
     var fracTypeSelect = document.getElementById('fractal-type');
     var palettePreset  = document.getElementById('palette-preset');
     var paramMaxit     = document.getElementById('param-maxit');
+    var paramBailout   = document.getElementById('param-bailout');
     var paramInside    = document.getElementById('param-inside');
     var paramOutside   = document.getElementById('param-outside');
     var juliaGroup     = document.getElementById('julia-params-group');
@@ -229,6 +234,14 @@
       });
     }
 
+    if (paramBailout) {
+      paramBailout.addEventListener('change', function () {
+        var n = parseInt(this.value, 10);
+        if (isNaN(n)) return;
+        if (wasmSetBailout) wasmSetBailout(n);
+      });
+    }
+
     if (paramInside) {
       paramInside.addEventListener('change', function () {
         var mode = parseInt(this.value, 10);
@@ -272,6 +285,10 @@
       /* Sync maxit input */
       if (paramMaxit && typeof p.i === 'number') {
         paramMaxit.value = p.i;
+      }
+      /* Sync bailout input */
+      if (paramBailout && typeof p.b === 'number') {
+        paramBailout.value = p.b;
       }
       /* Sync inside select */
       if (paramInside && typeof p.in === 'number') {
