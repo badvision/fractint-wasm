@@ -209,6 +209,33 @@ setvideomode (ax, bx, cx, dx)
       videoflag = 0;
     }
   goodmode = 1;
+#ifdef WASM_BUILD
+  if (dotmode == 0)
+    {
+      clear ();
+      wrefresh (curwin);
+    }
+  else if (dotmode == 11)
+    {
+      startdisk ();
+      dotwrite = writedisk;
+      dotread = readdisk;
+      lineread = normalineread;
+      linewrite = normaline;
+    }
+  else
+    {
+      /* dotmode 19 or any unknown value — treat as graphics mode */
+      putprompt ();
+      dotwrite = writevideo;
+      dotread = readvideo;
+      lineread = readvideoline;
+      linewrite = writevideoline;
+      videoflag = 1;
+      startvideo ();
+      setforgraphics ();
+    }
+#else
   switch (dotmode)
     {
     case 0:			/* text */
@@ -239,6 +266,7 @@ setvideomode (ax, bx, cx, dx)
       printf ("Bad mode %d\n", dotmode);
       exit (-1);
     }
+#endif
   if (dotmode != 0)
     {
       loaddac ();

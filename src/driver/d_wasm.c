@@ -810,6 +810,7 @@ static pthread_t     menu_thread_id;
 static _Atomic int   menu_done = 0;
 static int           menu_result  = 0;
 static int           menu_kbdchar = 0;
+static int           menu_watchdog_frames = 0;
 
 /* Fractint menu functions (declared in prototyp.h, already included above) */
 
@@ -1375,8 +1376,12 @@ static void wasm_main_loop_callback(void)
          * Non-blocking poll: check whether the menu pthread has finished.
          * menu_done is set atomically by menu_thread_func() before it returns.
          * pthread_join() is instant once the thread has already exited.
+         *
+         * Watchdog: if menu_done is never set (e.g. the thread crashed via
+         * exit(-1) / WASM unreachable trap), recover after ~5 s (300 frames).
          */
         if (atomic_load(&menu_done)) {
+            menu_watchdog_frames = 0;
             pthread_join(menu_thread_id, NULL);
             /* Clear key state so no stale keys linger into next calc */
             keybuffer  = 0;
@@ -1393,6 +1398,17 @@ static void wasm_main_loop_callback(void)
                 wasm_state = WS_DONE;
                 break;
             }
+        } else if (++menu_watchdog_frames > 300) {
+            /* Menu thread appears to have crashed — force recovery */
+            menu_watchdog_frames = 0;
+            atomic_store(&wasm_menu_active, 0);
+            atomic_store(&menu_done, 0);
+            /* Flush key channels */
+            key_head = key_tail = 0;
+            pthread_mutex_lock(&menu_chan.lock);
+            menu_chan.head = menu_chan.tail = 0;
+            pthread_mutex_unlock(&menu_chan.lock);
+            wasm_state = WS_DONE;
         }
         /* else: stay in WS_MENU, check again next frame */
         break;
@@ -1445,6 +1461,7 @@ void wasm_open_menu(int key)
     pthread_mutex_unlock(&menu_chan.lock);
 
     atomic_store(&menu_done, 0);
+    menu_watchdog_frames = 0;
     menu_thread_arg.trigger_key = key;
 
     wasm_state = WS_MENU;

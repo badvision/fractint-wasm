@@ -9,3 +9,8 @@ xfractint-20.04p16.tar.gz
 # Editor
 .vscode/
 .idea/
+
+# Node / Playwright
+node_modules/
+playwright-report/
+test-results/

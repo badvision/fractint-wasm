@@ -1,0 +1,18 @@
+{
+  "name": "fractint-wasm",
+  "version": "1.0.0",
+  "description": "A WebAssembly port of [Fractint](https://www.fractint.org/) — the legendary DOS fractal generator, running entirely in your browser.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}
