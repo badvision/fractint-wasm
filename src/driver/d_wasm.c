@@ -1411,7 +1411,14 @@ EMSCRIPTEN_KEEPALIVE
 void wasm_open_menu(int key)
 {
     if (atomic_load(&wasm_menu_active)) return;
-    if (wasm_state != WS_DONE) return;
+
+    if (wasm_state == WS_PAR_PRODUCE || wasm_state == WS_PAR_WAIT) {
+        /* Abort in-flight parallel render, then fall through to open menu */
+        pworkers_abort();
+    } else if (wasm_state != WS_DONE) {
+        /* Any other non-idle state (WS_CALCFRAC, WS_INIT_VIDEO, etc.) — drop */
+        return;
+    }
 
     /* Flush main key ring */
     key_head = key_tail = 0;
